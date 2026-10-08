@@ -28,10 +28,42 @@ Migrations: `bun run db:status`, `bun run db:rollback` (desfaz a ultima), `bun r
 
 ```bash
 bun run typecheck
-bun run test:unit  # so dominio, sem infraestrutura
-bun test           # tudo; exige a infraestrutura de pe: integracao usa Postgres e SQS reais
-                   # (cada arquivo de integracao cria e apaga o proprio banco)
+bun run test:unit          # dominio puro, sem infraestrutura (segundos)
+bun run test:integration   # Postgres e SQS reais, um processo
+bun run test:multiprocess  # 3+ instancias como processos separados (~1 min)
+bun test                   # tudo
 ```
+
+Integracao e multi-processo exigem `bun run infra:up`. Cada arquivo cria e apaga o proprio banco e as proprias filas:
+nada e compartilhado com o ambiente de desenvolvimento nem entre arquivos. Nenhum teste substitui Postgres ou SQS
+por mock.
+
+### Onde esta cada teste obrigatorio
+
+| Exigencia (secao 13) | Teste |
+|---|---|
+| Money: escala, arredondamento, entradas invalidas | `test/unit/domain/money.test.ts` |
+| Invariantes da Wallet | `test/unit/domain/wallet.test.ts` |
+| Regras de BET, WIN, LOSS, REFUND, ROLLBACK | `test/unit/domain/wager-settlement.test.ts` |
+| Conflito de moeda | `money.test.ts`, `wallet.test.ts`, `wager-settlement.test.ts` |
+| Idempotency key com payload divergente | `payload-hash.test.ts`, `integration/wagering.test.ts`, `http/api.test.ts` |
+| Migrations e constraints | `integration/schema.test.ts` (viola cada garantia em SQL; up/down/up) |
+| Atomicidade wallet, ledger, inbox, outbox | `schema.test.ts` (commit falha se faltar uma parte), `wagering.test.ts` |
+| Inbox e redelivery | `integration/sqs-consumer.test.ts`, `multiprocess/cluster.test.ts` |
+| Publishers concorrentes na mesma outbox | `outbox-and-references.test.ts` (2 publicadores), `cluster.test.ts` (3 instancias) |
+| Retry e DLQ | `sqs-consumer.test.ts` (backoff, redrive apos maxReceiveCount, DLQ imediata) |
+| Recuperacao apos reinicializacao | `cluster.test.ts` (3 instancias mortas por SIGKILL no meio do fluxo) |
+| 1. Mesma aposta 50x em paralelo | `concurrency.test.ts` (um processo), `cluster.test.ts` (espalhada em 3 processos) |
+| 2. Disputa pelo saldo da mesma wallet | `concurrency.test.ts`, `cluster.test.ts` (cenario 100 / 80 / 80) |
+| 3. Wallets distintas em paralelo | `concurrency.test.ts`, `cluster.test.ts` |
+| 4. 3 ou mais instancias simultaneas | `cluster.test.ts` |
+| 5. Worker morto depois do commit e antes do ack | `sqs-consumer.test.ts` (simulado), `cluster.test.ts` (SIGKILL real) |
+| 6. Dois publishers na mesma outbox | `outbox-and-references.test.ts` |
+| 7. ROLLBACK/REFUND antes da referencia | `wagering.test.ts`, `outbox-and-references.test.ts` |
+| 8. Reinicio com consistencia final | `cluster.test.ts` |
+
+Todos os testes de integracao terminam conferindo `wallet.balance == saldo reconstruido pelo ledger`
+(`expectLedgerConsistent`).
 
 ## API
 
