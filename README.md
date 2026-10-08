@@ -77,6 +77,7 @@ Todos os testes de integracao terminam conferindo `wallet.balance == saldo recon
 | `GET` | `/wagering/transactions/:transactionId` | por id interno |
 | `GET` | `/providers/:providerId/wagering/transactions/:externalTransactionId` | por id do provedor |
 | `GET` | `/health/live`, `/health/ready` | sem autenticacao |
+| `GET` | `/metrics` | Prometheus; sem autenticacao |
 
 Status por situacao (201, 200 replay, 202, 400, 404, 409, 422, 503) em [`ARCHITECTURE.md`](ARCHITECTURE.md#api-http-status).
 

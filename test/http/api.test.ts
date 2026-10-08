@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import type { INestApplication } from "@nestjs/common";
 import { loadConfig } from "../../src/config";
 import { createHttpApp } from "../../src/http-app";
+import { JsonLogger } from "../../src/infrastructure/observability/json-logger";
 import { type TestDatabase, createTestDatabase } from "../support/database";
 
 /** API HTTP de ponta a ponta: Nest + MikroORM + Postgres real + SQS real (readiness). */
@@ -9,7 +10,10 @@ let db: TestDatabase;
 let app: INestApplication;
 let base: string;
 
+const originalSink = JsonLogger.sink;
+
 beforeAll(async () => {
+  JsonLogger.sink = () => {}; // logs da aplicacao sao testados em observability.test.ts
   db = await createTestDatabase();
   app = await createHttpApp({ ...loadConfig(), databaseUrl: db.url, workers: [] }, { logger: false });
   await app.listen(0, "127.0.0.1");
@@ -19,6 +23,7 @@ beforeAll(async () => {
 afterAll(async () => {
   await app?.close();
   await db?.drop();
+  JsonLogger.sink = originalSink;
 });
 
 async function call(method: string, path: string, body?: unknown, headers: Record<string, string> = {}) {

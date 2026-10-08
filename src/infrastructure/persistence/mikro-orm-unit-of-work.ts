@@ -13,6 +13,7 @@ import type {
   InboxRepository,
   LedgerRepository,
   LedgerSummary,
+  Metrics,
   OutboxRepository,
   RunOptions,
   TransactionRunner,
@@ -53,6 +54,7 @@ export class MikroOrmTransactionRunner implements TransactionRunner {
     private readonly orm: MikroORM,
     private readonly clock: Clock,
     private readonly options: UnitOfWorkOptions = { lockTimeoutMs: 5_000 },
+    private readonly metrics?: Metrics,
   ) {}
 
   async run<T>(work: (uow: UnitOfWork) => Promise<T>, options: RunOptions = {}): Promise<T> {
@@ -61,7 +63,7 @@ export class MikroOrmTransactionRunner implements TransactionRunner {
         async (em) => {
           // SET LOCAL vale so para esta transacao; inteiro ja validado, sem interpolar texto de fora.
           await em.execute(`set local lock_timeout = ${Math.trunc(this.options.lockTimeoutMs)}`);
-          return work(new MikroOrmUnitOfWork(em, this.clock));
+          return work(new MikroOrmUnitOfWork(em, this.clock, this.metrics));
         },
         {
           isolationLevel:
@@ -70,13 +72,17 @@ export class MikroOrmTransactionRunner implements TransactionRunner {
         },
       );
     } catch (error) {
-      throw translateDriverError(error);
+      const translated = translateDriverError(error);
+      if (translated instanceof TransientInfrastructureError && translated.reason === "lock_timeout") {
+        this.metrics?.increment("wallet_lock_timeouts_total");
+      }
+      throw translated;
     }
   }
 
   async read<T>(work: (uow: UnitOfWork) => Promise<T>): Promise<T> {
     try {
-      return await work(new MikroOrmUnitOfWork(this.orm.em.fork(), this.clock));
+      return await work(new MikroOrmUnitOfWork(this.orm.em.fork(), this.clock, this.metrics));
     } catch (error) {
       throw translateDriverError(error);
     }
@@ -140,8 +146,8 @@ class MikroOrmUnitOfWork implements UnitOfWork {
   readonly inbox: InboxRepository;
   readonly outbox: OutboxRepository;
 
-  constructor(em: EntityManager, clock: Clock) {
-    this.wallets = new MikroOrmWalletRepository(em);
+  constructor(em: EntityManager, clock: Clock, metrics: Metrics | undefined) {
+    this.wallets = new MikroOrmWalletRepository(em, metrics);
     this.transactions = new MikroOrmWagerTransactionRepository(em, clock);
     this.ledger = new MikroOrmLedgerRepository(em);
     this.inbox = new MikroOrmInboxRepository(em);
@@ -173,7 +179,10 @@ class Tracked<D extends object, R extends object> {
 class MikroOrmWalletRepository implements WalletRepository {
   private readonly tracked = new Tracked<Wallet, WalletRecord>();
 
-  constructor(private readonly em: EntityManager) {}
+  constructor(
+    private readonly em: EntityManager,
+    private readonly metrics: Metrics | undefined,
+  ) {}
 
   async findById(id: string): Promise<Wallet | undefined> {
     const record = await this.em.findOne(WalletRecord, { id });
@@ -181,7 +190,10 @@ class MikroOrmWalletRepository implements WalletRepository {
   }
 
   async lockById(id: string): Promise<Wallet | undefined> {
+    const started = performance.now();
     const record = await this.em.findOne(WalletRecord, { id }, { lockMode: LockMode.PESSIMISTIC_WRITE, refresh: true });
+    // Tempo na fila da wallet: alto aqui = wallet quente (contencao), nao banco lento.
+    this.metrics?.observe("wallet_lock_wait_seconds", (performance.now() - started) / 1000);
     return record === null ? undefined : this.tracked.remember(walletToDomain(record), record);
   }
 

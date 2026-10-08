@@ -323,6 +323,45 @@ por wallet, ao custo de paralelismo.
   esperar o backoff.
 - Esgotadas as tentativas (8, ~15 min): `REJECTED` com `REFERENCE_NOT_FOUND` e `WagerTransactionRejected`.
 
-## A fazer nas proximas fases
+## Observabilidade
 
-- Metricas reais (hoje `NoopMetrics`) e logs com correlacao automatica (fase 6).
+### Logs
+
+Uma linha JSON por evento (`time`, `level`, `context`, `message`). Os ids de correlacao entram **sozinhos** em toda
+linha emitida durante uma requisicao ou mensagem, via `AsyncLocalStorage` (`application/log-context.ts`):
+
+| Campo | Quem coloca |
+|---|---|
+| `correlationId` | header `x-correlation-id` (ou gerado; devolvido na resposta); `correlationId` do envelope SQS |
+| `messageId` | consumidor SQS, por mensagem |
+| `providerId`, `walletId` | caso de uso, ao receber o comando |
+| `transactionId` | caso de uso, ao decidir; worker de referencias |
+
+Cada requisicao gera uma linha de acesso (`message: "http"`, rota como template, status, duracao) e cada mensagem SQS
+gera `"mensagem processada"` com o desfecho. **Nada de valor financeiro ou payload**: o logger mascara `money`,
+`amount`, `balance`, `payload`, `body` e `authorization`, mesmo que alguem os passe por engano (testado). Os logs do
+proprio NestJS saem no mesmo formato.
+
+### Metricas (`GET /metrics`, formato Prometheus, aberto como os health checks)
+
+Catalogo tipado em `application/metrics-catalog.ts`: a porta `Metrics` nao aceita nome nem rotulo fora dele. Rotulos
+de cardinalidade baixa e conhecida (nunca ids). Cada instancia tem o rotulo `instance_id`.
+
+| Exigencia | Metrica |
+|---|---|
+| Transacoes por status | `wager_transactions_total{kind,status}`, `pending_reference_transactions` |
+| Duplicatas detectadas | `wager_duplicates_total{source}`, `sqs_messages_total{result="duplicate"}` |
+| Retries | `sqs_retries_total`, `wager_unique_race_retries_total`, `outbox_publish_failures_total` |
+| Mensagens em DLQ | `sqs_dlq_messages` (profundidade real da DLQ), `sqs_dlq_total{reason}` |
+| Conflitos de lock | `wallet_lock_wait_seconds` (tempo na fila da wallet), `wallet_lock_timeouts_total` |
+| Outbox lag | `outbox_lag_seconds` (idade do evento pendente mais antigo), `outbox_pending_events` |
+| Latencia de processamento | `wager_processing_seconds{source,status}`, `sqs_processing_seconds`, `http_request_duration_seconds` |
+| Reconciliacao | `reconciliations_total{result}`, `reconciliation_divergences_total` |
+
+Os gauges de estado (outbox, pendencias, DLQ) sao lidos **na hora do scrape**, do banco e do SQS: refletem o sistema
+inteiro, nao a memoria de uma instancia. Se a fonte falhar, o gauge vira `NaN` sem derrubar o scrape.
+
+### Health checks
+
+`/health/live` nao toca dependencias (falha = reiniciar o processo). `/health/ready` checa PostgreSQL e SQS com prazo
+de 2 s cada (falha = tirar do balanceador). Ambos sem autenticacao.

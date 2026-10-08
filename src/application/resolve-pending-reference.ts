@@ -5,6 +5,7 @@ import {
 } from "../domain/wagering/wager-settlement";
 import { WagerTransactionStatus } from "../domain/wagering/wager-transaction";
 import type { EventFactory } from "./event-factory";
+import { withLogContext } from "./log-context";
 import type { Clock, IdGenerator, Metrics, PendingReferenceFinder, TransactionRunner } from "./ports";
 
 export type ResolutionResult = "processed" | "rejected" | "still_pending" | "expired" | "skipped";
@@ -25,6 +26,10 @@ export class ResolvePendingReference {
   ) {}
 
   async execute(transactionId: string, walletId: string): Promise<ResolutionResult> {
+    return withLogContext({ transactionId, walletId }, () => this.resolve(transactionId, walletId));
+  }
+
+  private async resolve(transactionId: string, walletId: string): Promise<ResolutionResult> {
     const result = await this.runner.run(async (uow) => {
       const wallet = await uow.wallets.lockById(walletId);
       const transaction = await uow.transactions.findById(transactionId);

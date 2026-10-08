@@ -1,6 +1,6 @@
 import { loadConfig } from "./config";
 import { createHttpApp } from "./http-app";
-import { JsonLogger } from "./infrastructure/system";
+import { JsonLogger } from "./infrastructure/observability/json-logger";
 
 async function bootstrap(): Promise<void> {
   const config = loadConfig();

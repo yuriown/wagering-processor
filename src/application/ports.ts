@@ -1,4 +1,5 @@
 import type { Money } from "../domain/money";
+import type { CounterLabels, CounterName, HistogramLabels, HistogramName } from "./metrics-catalog";
 import type { InboxMessage } from "../domain/messaging/inbox-message";
 import type { OutboxMessage } from "../domain/messaging/outbox-message";
 import type { WagerTransaction } from "../domain/wagering/wager-transaction";
@@ -129,9 +130,10 @@ export interface EventPublisher {
   publish(messages: readonly ClaimedOutboxMessage[]): Promise<PublishResult[]>;
 }
 
+/** Metricas do catalogo (metrics-catalog.ts): nome ou rotulo fora dele nao compila. */
 export interface Metrics {
-  increment(name: string, labels?: Record<string, string>, value?: number): void;
-  observe(name: string, value: number, labels?: Record<string, string>): void;
+  increment<N extends CounterName>(name: N, labels?: CounterLabels<N>, value?: number): void;
+  observe<N extends HistogramName>(name: N, value: number, labels?: HistogramLabels<N>): void;
 }
 
 export interface AppLogger {

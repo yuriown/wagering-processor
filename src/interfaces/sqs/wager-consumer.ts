@@ -12,6 +12,7 @@ import {
   ValidationError,
   WalletNotFoundError,
 } from "../../application/errors";
+import { annotateLogContext, withTrackedLogContext } from "../../application/log-context";
 import type { AppLogger, Metrics } from "../../application/ports";
 import type { ProcessWagerTransaction } from "../../application/process-wager-transaction";
 import { DomainError, InvariantViolationError } from "../../domain/shared/domain-error";
@@ -140,14 +141,19 @@ export class WagerTransactionConsumer {
     }
   }
 
-  /** Processa uma mensagem. Devolve false se ela ficou pendente (sem ack). */
-  private async handle(queueUrl: string, message: Message): Promise<boolean> {
+  /** Processa uma mensagem dentro do contexto de log dela. Devolve false se ficou pendente (sem ack). */
+  private handle(queueUrl: string, message: Message): Promise<boolean> {
+    return withTrackedLogContext({ messageId: message.MessageId ?? "?" }, () => this.handleInContext(queueUrl, message));
+  }
+
+  private async handleInContext(queueUrl: string, message: Message): Promise<boolean> {
     const started = performance.now();
     const receiveCount = Number.parseInt(message.Attributes?.ApproximateReceiveCount ?? "1", 10);
     let messageId = message.MessageId ?? "?";
     try {
       const parsed = parseWagerMessage(message.Body);
       messageId = parsed.messageId;
+      annotateLogContext({ messageId: parsed.messageId, correlationId: parsed.correlationId });
       const outcome = await this.process.execute(parsed.command, {
         correlationId: parsed.correlationId,
         causationId: parsed.messageId,
@@ -155,10 +161,17 @@ export class WagerTransactionConsumer {
       });
       await this.hooks.afterCommit?.(parsed.messageId);
       await this.ack(queueUrl, message);
-      this.metrics.increment("sqs_messages_total", {
-        result: outcome.idempotentReplay ? "duplicate" : outcome.transaction.status,
+      const result = outcome.idempotentReplay ? "duplicate" : outcome.transaction.status;
+      const seconds = (performance.now() - started) / 1000;
+      this.metrics.increment("sqs_messages_total", { result });
+      this.metrics.observe("sqs_processing_seconds", seconds);
+      this.logger.info("mensagem processada", {
+        result,
+        kind: outcome.transaction.kind,
+        failureCode: outcome.transaction.failureCode,
+        receiveCount,
+        durationMs: Math.round(seconds * 1000),
       });
-      this.metrics.observe("sqs_processing_seconds", (performance.now() - started) / 1000);
       return true;
     } catch (error) {
       if (error instanceof SimulatedCrash) return false;

@@ -27,9 +27,6 @@ export class PublishOutbox {
 
   /** Uma rodada. Devolve quantos eventos foram publicados. */
   async runOnce(): Promise<number> {
-    const lag = await this.store.oldestPendingAgeMs(this.clock.now());
-    this.metrics.observe("outbox_lag_seconds", lag / 1000);
-
     const claimed = await this.store.claim(this.options.owner, this.options.batchSize, this.options.leaseMs);
     if (claimed.length === 0) return 0;
 
