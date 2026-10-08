@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, setDefaultTimeout, test } from "bun:test";
 import type { ClaimedOutboxMessage, EventPublisher, PublishResult } from "../../src/application/ports";
 import { PublishOutbox } from "../../src/application/publish-outbox";
 import { PendingReferenceSweep, ResolvePendingReference } from "../../src/application/resolve-pending-reference";
@@ -11,6 +11,9 @@ import { SystemClock, UuidV7Generator } from "../../src/infrastructure/system";
 import { type TestApplication, buildApplication, command, ctx, expectLedgerConsistent, openWallet } from "../support/application";
 import { type TestDatabase, createTestDatabase } from "../support/database";
 import { type TestQueues, createTestQueues, drain } from "../support/queues";
+
+// Esperas reais de visibilidade e backoff do SQS (segundos), nao relogio falso.
+setDefaultTimeout(30_000);
 
 let db: TestDatabase;
 let app: TestApplication;

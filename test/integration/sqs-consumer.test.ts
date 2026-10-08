@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { TransientInfrastructureError } from "../../src/application/errors";
 import type { ProcessWagerTransaction } from "../../src/application/process-wager-transaction";
 import { QueueUrls } from "../../src/infrastructure/messaging/queue-urls";
@@ -9,6 +9,9 @@ import { type TestDatabase, createTestDatabase } from "../support/database";
 import { type TestQueues, createTestQueues, drain, queueDepth } from "../support/queues";
 
 /** Consumidor contra MiniStack e Postgres reais. */
+// Esperas reais de visibilidade e backoff do SQS (segundos), nao relogio falso.
+setDefaultTimeout(30_000);
+
 let db: TestDatabase;
 let app: TestApplication;
 let queues: TestQueues;

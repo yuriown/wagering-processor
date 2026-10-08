@@ -1,3 +1,0 @@
-[test]
-# Testes de SQS esperam visibilidade e backoff reais (segundos), nao relogio falso.
-timeout = 30000
