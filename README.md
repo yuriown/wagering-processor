@@ -16,8 +16,11 @@ Decisoes, trade-offs e limitacoes: [`ARCHITECTURE.md`](ARCHITECTURE.md).
 ```bash
 bun install
 bun run infra:up   # PostgreSQL (porta 55432) + MiniStack/SQS (porta 4566) + criacao das filas
+bun run db:migrate # aplica as migrations
 bun run start      # API em http://localhost:3000
 ```
+
+Migrations: `bun run db:status`, `bun run db:rollback` (desfaz a ultima), `bun run db:rollback -- --all`.
 
 `bun run infra:down` derruba tudo e apaga os volumes.
 
@@ -27,6 +30,7 @@ bun run start      # API em http://localhost:3000
 bun run typecheck
 bun run test:unit  # so dominio, sem infraestrutura
 bun test           # tudo; exige a infraestrutura de pe: integracao usa Postgres e SQS reais
+                   # (cada arquivo de integracao cria e apaga o proprio banco)
 ```
 
 ## Filas

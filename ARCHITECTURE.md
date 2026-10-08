@@ -124,9 +124,49 @@ e `WalletBalanceChanged` (so quando o saldo muda). `data` leva `MoneyProps`, nun
 publicados, preservando a ordem por wallet. `OutboxMessage.id` = `eventId`, para o consumidor deduplicar,
 ja que a outbox publica pelo menos uma vez.
 
+## Schema: as garantias moram no banco
+
+Migrations escritas a mao em SQL (`src/infrastructure/persistence/migrations/`), executadas pelo Migrator do
+MikroORM com lista explicita, cada uma com `up` e `down`. Sem snapshot de diff: constraints, triggers e indices
+parciais sao exatamente o que um gerador automatico nao produz. Migracao nova = arquivo novo no fim da lista.
+
+| Garantia | Onde |
+|---|---|
+| Uma wallet por player + moeda | `UNIQUE (player_id, currency)` |
+| Saldo nunca negativo | `CHECK (balance >= 0)` na wallet; `balance_before/after >= 0` no ledger |
+| Operacao do provedor unica | `UNIQUE (provider_id, external_transaction_id)` |
+| Idempotency key unica | `UNIQUE (provider_id, idempotency_key)`: escopo do provedor, um provedor nao colide com outro |
+| Referencia obrigatoria/proibida por tipo | `CHECK` por `kind` |
+| OPENING so interno, uma por wallet | `CHECK ((kind = 'OPENING') = (provider_id = 'internal'))` + indice unico parcial |
+| Reverter uma referencia uma vez | indice unico parcial `(reference_transaction_id) WHERE status = 'PROCESSED' AND kind IN ('REFUND','ROLLBACK')` |
+| Estado terminal definitivo | trigger `BEFORE UPDATE`: terminal nao muda; campos da operacao imutaveis; nada volta a PENDING |
+| Coerencia de estado | `CHECK`: failure_code se e so se REJECTED/FAILED; processed_at se e so se terminal; agendamento se e so se PENDING_REFERENCE |
+| Aritmetica do lancamento | `CHECK (balance_after = balance_before +/- amount)` |
+| Ledger imutavel | trigger que recusa `UPDATE`, `DELETE` e `TRUNCATE` (wallets e transacoes tambem nao se apagam) |
+| Ledger sem buraco nem duplicata | `UNIQUE (wallet_id, wallet_version)` + trigger: `balance_before` = `balance_after` da versao anterior |
+| Um lancamento por transacao e wallet | `UNIQUE (transaction_id, wallet_id)` |
+| Saldo == ultimo lancamento | constraint trigger **deferred** na wallet e no ledger |
+| Lancamento so de transacao PROCESSED que move saldo, com valor, moeda e direcao coerentes | constraint trigger deferred no ledger |
+| Transacao PROCESSED que move saldo tem lancamento | constraint trigger deferred na transacao |
+| Inbox deduplica | `PRIMARY KEY (consumer_name, message_id)` |
+| Outbox guarda o envelope do proprio evento | `CHECK (payload->>'eventId' = id AND payload->>'eventType' = event_type)`; conteudo imutavel; publicado e final |
+
+**Por que deferred.** Wallet, transacao e lancamento sao escritos em comandos separados da mesma transacao;
+a checagem cruzada so faz sentido quando todos existem. `DEFERRABLE INITIALLY DEFERRED` roda a checagem no
+`COMMIT`: se o saldo mudou sem lancamento (ou o contrario), o commit inteiro falha e nada e confirmado.
+O custo e uma consulta por indice por linha escrita.
+
+**Dinheiro no banco**: `numeric(20,2)`, moeda em coluna separada. O driver devolve `numeric` como string,
+que vai direto para `Money.from` sem passar por `number`.
+
+**Limitacao conhecida**: as triggers de imutabilidade valem ate para o dono das tabelas, mas um superusuario
+pode desliga-las. Em producao, a aplicacao usaria um papel sem `TRIGGER`/`TRUNCATE` e as migrations, outro.
+
+Os testes de integracao (`test/integration/schema.test.ts`) violam cada linha desta tabela direto em SQL,
+sem passar pelo dominio, e provam que `down` total remove tudo e `up` recria.
+
 ## A fazer nas proximas fases
 
-- Schema, constraints e migrations (fase 2).
 - Estrategia transacional e de lock (fase 3).
 - Consumer SQS, outbox e workers (fase 4).
 - Autenticacao: nao implementada; desenho e ponto de extensao (fase 3).
