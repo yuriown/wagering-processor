@@ -6,6 +6,8 @@ const WORKER_NAMES: readonly WorkerName[] = ["consumer", "outbox", "references"]
 export interface AppConfig {
   readonly port: number;
   readonly databaseUrl: string;
+  /** Conexoes por instancia. Cada transacao de escrita prende uma enquanto segura o lock da wallet. */
+  readonly dbPoolMax: number;
   /** Identifica esta instancia (lease da outbox, logs). */
   readonly instanceId: string;
   /** Quanto uma transacao espera pelo lock de uma wallet antes de responder 503. */
@@ -41,6 +43,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   return {
     port: integer(env.PORT, 3000),
     databaseUrl: env.DATABASE_URL ?? "postgres://wagering:wagering@localhost:55432/wagering",
+    dbPoolMax: integer(env.DB_POOL_MAX, 10),
     instanceId: env.INSTANCE_ID ?? `${hostname()}-${process.pid}`,
     lockTimeoutMs: integer(env.LOCK_TIMEOUT_MS, 5_000),
     workers: workers(env.WORKERS),

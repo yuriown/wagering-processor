@@ -229,10 +229,16 @@ sem passar pelo dominio, e provam que `down` total remove tudo e `up` recria.
 
 1. **Caminho rapido sem lock**: procura a idempotency key. Se existir, e replay ou conflito, sem transacao de escrita.
 2. Abre a transacao (READ COMMITTED) e trava a wallet: `SELECT ... FOR UPDATE` (`lockById`).
-3. **Com o lock na mao, confere a idempotencia de novo.** Quem esperou pelo lock ve o que o anterior confirmou e
-   responde replay. E isso que faz 50 envios simultaneos da mesma aposta resultarem num unico debito.
+3. **Com o lock na mao, confere a idempotencia de novo**, numa unica consulta (key **ou** operacao do provedor). Quem
+   esperou pelo lock ve o que o anterior confirmou e responde replay. E isso que faz 50 envios simultaneos da mesma
+   aposta resultarem num unico debito.
 4. Resolve a referencia, aplica as regras do dominio e registra transacao, saldo, lancamento, inbox e eventos.
 5. Um unico flush e COMMIT. As constraint triggers deferred conferem saldo == ledger nesse momento.
+6. **Depois do COMMIT**, sem o lock: antecipa as pendencias que esperavam por esta operacao.
+
+Tudo o que acontece entre o `FOR UPDATE` e o COMMIT define o teto de uma wallet quente (`1 / tempo com o lock`). O
+teste de carga mediu esse teto e guiou a retirada de dois round-trips desse trecho: de 27 para 40 req/s numa unica
+wallet ([docs/load-test.md](docs/load-test.md)).
 
 **Por que lock pessimista e nao otimista.** Numa wallet disputada (muitas apostas do mesmo jogador), lock otimista
 vira tempestade de retry: todos leem a versao N e so um grava. Com `FOR UPDATE`, a fila se forma no Postgres, cada
@@ -348,7 +354,7 @@ as que nao comecaram com visibilidade 0, para outra instancia pegar na hora.
 2. O relay **reivindica** um lote: `UPDATE ... SET locked_by, locked_until WHERE id IN (SELECT ... FOR UPDATE SKIP
    LOCKED)`. Dois publicadores no mesmo instante pegam lotes disjuntos (testado).
 3. Publica com `SendMessageBatch`: `MessageGroupId = walletId`, `MessageDeduplicationId = eventId`.
-4. Marca `published_at` **so se o lease ainda for dele**. Falha de publicacao: `attempts + 1`, `next_attempt_at`
+4. Marca `published_at` do lote inteiro num unico `UPDATE`, **so nos que ainda tem lease dele**. Falha de publicacao: `attempts + 1`, `next_attempt_at`
    com backoff (1 s .. 60 s, sem limite: evento confirmado nao se perde), lease liberado.
 
 **Processo morre depois do commit e antes de publicar**: o evento continua pendente no banco; quando o lease vence
@@ -364,8 +370,8 @@ por wallet, ao custo de paralelismo.
 - A transacao fica `PENDING_REFERENCE` com `next_reference_check_at`. O worker varre as vencidas (indice parcial),
   trava a wallet, **rele a transacao sob o lock** e so entao decide. Varios workers concorrentes aplicam uma vez so
   (testado com 5).
-- Quando a referencia chega, `expediteWaitingFor` antecipa a verificacao das dependentes para "agora": nao e preciso
-  esperar o backoff.
+- Quando a referencia chega, `expediteWaitingFor` antecipa a verificacao das dependentes para "agora", logo depois
+  do COMMIT e fora do lock: nao e preciso esperar o backoff. Se essa antecipacao falhar, nada se perde, so espera.
 - Esgotadas as tentativas (8, ~15 min): `REJECTED` com `REFERENCE_NOT_FOUND` e `WagerTransactionRejected`.
 
 ## Observabilidade
@@ -426,7 +432,7 @@ de 2 s cada (falha = tirar do balanceador). Ambos sem autenticacao.
 
 | Decisao / limite | Por que | Custo |
 |---|---|---|
-| Lock pessimista por wallet | sem tempestade de retry em wallet quente; coordenacao no banco, vale para N instancias | operacoes da mesma wallet sao serializadas: o teto de uma wallet e ~1 / duracao da transacao |
+| Lock pessimista por wallet | sem tempestade de retry em wallet quente; coordenacao no banco, vale para N instancias | operacoes da mesma wallet sao serializadas: ~40 req/s numa unica wallet no notebook do teste de carga |
 | Checagem saldo == ledger por constraint trigger deferred | a garantia vale para qualquer escrita, nao so para este codigo | uma consulta por indice extra por linha escrita no COMMIT |
 | Uma reversao por referencia, de qualquer tipo | evita creditar duas vezes uma BET (REFUND + ROLLBACK) | mais estrito que a letra do enunciado ("pelo mesmo tipo") |
 | `FAILED` modelado, mas nao produzido | transitorio e retentado; mensagem com erro permanente vai para a DLQ antes de existir transacao gravada | o estado existe (transicoes, constraints, `PROCESSING_FAILED`) para um caminho que hoje nao ocorre |

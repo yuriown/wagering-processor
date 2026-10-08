@@ -32,6 +32,12 @@ export interface WagerTransactionRepository {
   findById(id: string): Promise<WagerTransaction | undefined>;
   findByExternalId(providerId: string, externalTransactionId: string): Promise<WagerTransaction | undefined>;
   findByIdempotencyKey(providerId: string, idempotencyKey: string): Promise<WagerTransaction | undefined>;
+  /** Numa consulta so: a transacao desta key e a desta operacao do provedor (podem ser a mesma, outra ou nenhuma). */
+  findExisting(
+    providerId: string,
+    idempotencyKey: string,
+    externalTransactionId: string,
+  ): Promise<{ byKey: WagerTransaction | undefined; byOperation: WagerTransaction | undefined }>;
   /** Ja existe REFUND/ROLLBACK PROCESSED apontando para esta transacao? */
   hasProcessedReversalOf(referenceTransactionId: string): Promise<boolean>;
   /** Antecipa a verificacao das transacoes que esperam por (providerId, externalTransactionId). */
@@ -112,8 +118,8 @@ export interface OutboxStore {
    * em ordem de ocorrencia. Publicadores concorrentes nunca recebem o mesmo evento ao mesmo tempo.
    */
   claim(owner: string, limit: number, leaseMs: number): Promise<ClaimedOutboxMessage[]>;
-  /** Marca publicado se o lease ainda for deste dono; devolve false se outro ja assumiu. */
-  markPublished(id: string, owner: string, at: Date): Promise<boolean>;
+  /** Marca publicados (num comando so) os que ainda tem lease deste dono; devolve os ids marcados. */
+  markPublished(ids: readonly string[], owner: string, at: Date): Promise<string[]>;
   /** Devolve o evento para a fila de pendentes, com nova tentativa agendada. */
   reschedule(id: string, owner: string, attempts: number, nextAttemptAt: Date, error: string): Promise<void>;
   /** Idade do evento pendente mais antigo, em ms (0 se nao houver). */

@@ -52,17 +52,18 @@ export class SqlOutboxStore implements OutboxStore {
       .sort((a, b) => a.occurredAt.getTime() - b.occurredAt.getTime());
   }
 
-  async markPublished(id: string, owner: string, at: Date): Promise<boolean> {
+  async markPublished(ids: readonly string[], owner: string, at: Date): Promise<string[]> {
+    if (ids.length === 0) return [];
     // So quem ainda detem o lease marca. Se outro assumiu e publicou tambem, o evento saiu duas vezes
-    // (o consumidor deduplica por eventId), mas e marcado uma vez so.
+    // (o consumidor deduplica por eventId), mas e marcado uma vez so. Um comando para o lote inteiro.
     const rows = await this.execute<{ id: string }>(
       `update outbox_messages
           set published_at = ?, locked_by = null, locked_until = null, last_error = null
-        where id = ? and locked_by = ? and published_at is null
+        where id in (?) and locked_by = ? and published_at is null
        returning id`,
-      [at, id, owner],
+      [at, ids, owner],
     );
-    return rows.length === 1;
+    return rows.map((row) => row.id);
   }
 
   async reschedule(id: string, owner: string, attempts: number, nextAttemptAt: Date, error: string): Promise<void> {

@@ -233,6 +233,24 @@ class MikroOrmWagerTransactionRepository implements WagerTransactionRepository {
     return this.one({ providerId, idempotencyKey });
   }
 
+  async findExisting(
+    providerId: string,
+    idempotencyKey: string,
+    externalTransactionId: string,
+  ): Promise<{ byKey: WagerTransaction | undefined; byOperation: WagerTransaction | undefined }> {
+    // Uma ida ao banco em vez de duas: roda com o lock da wallet na mao, cada round-trip conta.
+    const records = await this.em.find(
+      WagerTransactionRecord,
+      { providerId, $or: [{ idempotencyKey }, { externalTransactionId }] },
+      { populate: ["wallet"] as never },
+    );
+    const found = records.map((record) => ({ record, domain: this.tracked.remember(transactionToDomain(record), record) }));
+    return {
+      byKey: found.find((f) => f.record.idempotencyKey === idempotencyKey)?.domain,
+      byOperation: found.find((f) => f.record.externalTransactionId === externalTransactionId)?.domain,
+    };
+  }
+
   async hasProcessedReversalOf(referenceTransactionId: string): Promise<boolean> {
     const count = await this.em.count(WagerTransactionRecord, {
       referenceTransaction: referenceTransactionId,

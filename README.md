@@ -42,7 +42,10 @@ bun run test:unit          # dominio puro, sem infraestrutura (segundos)
 bun run test:integration   # Postgres e SQS reais, um processo
 bun run test:multiprocess  # 3+ instancias como processos separados (~1 min)
 bun test                   # tudo
+bun run test:load          # teste de carga (~3 min): vazao, p50/p95/p99, conflitos, outbox lag
 ```
+
+Teste de carga: metodo, tres rodadas comparadas e analise em [`docs/load-test.md`](docs/load-test.md).
 
 Integracao e multi-processo exigem `bun run infra:up`. Cada arquivo cria e apaga o proprio banco e as proprias filas:
 nada e compartilhado com o ambiente de desenvolvimento nem entre arquivos. Nenhum teste substitui Postgres ou SQS
@@ -120,6 +123,7 @@ bun run sqs:send -- <walletId> <playerId> BET 25.00
 | `WORKERS` | `consumer,outbox,references` | `none` desliga |
 | `SQS_CONSUMERS` | `2` | loops de long polling por instancia |
 | `LOCK_TIMEOUT_MS` | `5000` | espera pelo lock da wallet antes de 503 |
+| `DB_POOL_MAX` | `10` | conexoes por instancia (mais nao ajudou no teste de carga) |
 | `OUTBOX_LEASE_MS` | `30000` | prazo para um publicador concluir o lote |
 
 O SQS e emulado pelo [MiniStack](https://ministack.org), compativel com a API do LocalStack:
