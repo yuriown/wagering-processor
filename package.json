@@ -1,0 +1,26 @@
+{
+  "name": "wagering-processor",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "bun src/main.ts",
+    "dev": "bun --watch src/main.ts",
+    "infra:up": "docker compose up -d --wait postgres sqs && docker compose run --rm sqs-init",
+    "infra:down": "docker compose down -v",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@aws-sdk/client-sqs": "^3.1148.0",
+    "@nestjs/common": "^12.1.2",
+    "@nestjs/core": "^12.1.2",
+    "@nestjs/platform-express": "^12.1.2",
+    "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.2"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.2",
+    "@types/express": "^5.0.6",
+    "typescript": "^7.0.2"
+  }
+}
