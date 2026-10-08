@@ -40,4 +40,10 @@ aws_sqs create-queue \
   --attributes file:///tmp/attributes.json \
   --query QueueUrl --output text
 
+# Eventos de integracao publicados pela outbox (WagerTransactionProcessed, WalletBalanceChanged...).
+aws_sqs create-queue \
+  --queue-name wager-events.fifo \
+  --attributes FifoQueue=true \
+  --query QueueUrl --output text
+
 echo "filas prontas"

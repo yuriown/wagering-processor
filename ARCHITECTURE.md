@@ -255,6 +255,74 @@ Erros sempre como `{ "error": { "code", "message", "details"? } }`. A regra prat
 pelo JWKS do realm, `iss`, `aud`, `exp`) e devolveria `provider_id`. Mensagens da fila sao canal interno confiavel,
 mas o `providerId` delas passa pelas mesmas validacoes de dominio.
 
+## Processos e workers
+
+Um unico binario. Cada instancia roda a API e, conforme `WORKERS` (padrao: todos), os workers:
+
+| Worker | O que faz | Concorrencia entre instancias |
+|---|---|---|
+| `consumer` | le `wager-transactions.fifo` (long polling) | o SQS entrega cada mensagem a um consumidor por vez; a inbox cobre a redelivery |
+| `outbox` | publica eventos pendentes em `wager-events.fifo` | `FOR UPDATE SKIP LOCKED` + lease |
+| `references` | reavalia transacoes `PENDING_REFERENCE` vencidas | lock da wallet + releitura sob o lock |
+
+Os workers sobem em `onApplicationBootstrap` e param em `beforeApplicationShutdown`, **antes** de o banco e o
+cliente SQS serem fechados (`onApplicationShutdown`).
+
+## Consumidor SQS
+
+- Usa **o mesmo** `ProcessWagerTransaction` do HTTP. A inbox `(consumerName, messageId)` e gravada no mesmo COMMIT
+  do efeito financeiro. **O ack (`DeleteMessage`) so acontece depois do commit.**
+- `messageId` e o do envelope (do provedor), estavel entre redeliveries e republicacoes. O `payloadHash` da inbox e o
+  SHA-256 do envelope canonico: mesmo `messageId` com outro conteudo nao e redelivery, vai para a DLQ.
+- Ordem: dentro do lote, cada `MessageGroupId` (walletId) e processado em sequencia, e grupos diferentes em paralelo.
+  Se uma mensagem do grupo falha, as seguintes do mesmo grupo voltam para a fila (visibilidade 0) para nao passarem
+  na frente.
+
+| Falha | Exemplos | O que acontece |
+|---|---|---|
+| **negocio** (terminal) | wallet inexistente, conflito de idempotencia | ack + log + metrica |
+| **permanente** | JSON invalido, tipo desconhecido, payload invalido, `messageId` reusado | envia para a DLQ com o motivo nos atributos, depois ack |
+| **transitoria** | banco fora, lock timeout, erro desconhecido | sem ack; `ChangeMessageVisibility` com backoff exponencial (2 s .. 60 s) |
+
+Transitoria repetida: depois de `maxReceiveCount` (5) entregas, o **redrive da propria fila** move para a DLQ. Erro
+inesperado e tratado como transitorio de proposito: tenta algumas vezes antes de desistir.
+
+Rejeicao de negocio **ja registrada** (ex.: `INSUFFICIENT_FUNDS`) nao e falha: a transacao fica `REJECTED`, o evento
+sai pela outbox e a mensagem e confirmada.
+
+**Crash entre commit e ack**: a mensagem volta quando a visibilidade vence; a inbox (ou a idempotency key) reconhece
+e responde replay; o ack acontece. Nenhum efeito duplicado. Testado em processo (`SimulatedCrash`); o teste com o
+processo morto de verdade por SIGKILL (`FAULT_INJECTION=crash-after-commit`, so em teste) fica na suite multi-processo.
+
+**SIGTERM**: para de buscar (o long polling e abortado), termina as mensagens ja iniciadas (commit + ack) e devolve
+as que nao comecaram com visibilidade 0, para outra instancia pegar na hora.
+
+## Outbox
+
+1. O evento e gravado na mesma transacao do efeito. Nada e publicado antes do COMMIT.
+2. O relay **reivindica** um lote: `UPDATE ... SET locked_by, locked_until WHERE id IN (SELECT ... FOR UPDATE SKIP
+   LOCKED)`. Dois publicadores no mesmo instante pegam lotes disjuntos (testado).
+3. Publica com `SendMessageBatch`: `MessageGroupId = walletId`, `MessageDeduplicationId = eventId`.
+4. Marca `published_at` **so se o lease ainda for dele**. Falha de publicacao: `attempts + 1`, `next_attempt_at`
+   com backoff (1 s .. 60 s, sem limite: evento confirmado nao se perde), lease liberado.
+
+**Processo morre depois do commit e antes de publicar**: o evento continua pendente no banco; quando o lease vence
+(30 s), qualquer instancia publica. **Publicacao duplicada** (publicou e morreu antes de marcar) e segura: o
+`eventId` e estavel, o SQS FIFO deduplica em 5 min e o consumidor deve deduplicar por `eventId`.
+
+**Limitacao**: com varios publicadores, eventos da mesma wallet podem sair fora de ordem entre lotes diferentes. O
+consumidor ordena por `walletVersion` (em `WalletBalanceChanged`) e `occurredAt`. Ordem estrita exigiria reivindicar
+por wallet, ao custo de paralelismo.
+
+## Referencias fora de ordem: worker
+
+- A transacao fica `PENDING_REFERENCE` com `next_reference_check_at`. O worker varre as vencidas (indice parcial),
+  trava a wallet, **rele a transacao sob o lock** e so entao decide. Varios workers concorrentes aplicam uma vez so
+  (testado com 5).
+- Quando a referencia chega, `expediteWaitingFor` antecipa a verificacao das dependentes para "agora": nao e preciso
+  esperar o backoff.
+- Esgotadas as tentativas (8, ~15 min): `REJECTED` com `REFERENCE_NOT_FOUND` e `WagerTransactionRejected`.
+
 ## A fazer nas proximas fases
-- Consumer SQS, publicador da outbox e worker de referencias pendentes (fase 4).
+
 - Metricas reais (hoje `NoopMetrics`) e logs com correlacao automatica (fase 6).
