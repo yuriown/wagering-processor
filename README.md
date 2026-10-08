@@ -4,25 +4,35 @@ Servico financeiro que processa transacoes de apostas (`BET`, `WIN`, `LOSS`, `RE
 vindas de varios provedores, por HTTP e por SQS, mantendo saldo, ledger, inbox e outbox consistentes
 mesmo com mensagens duplicadas, fora de ordem e varias instancias concorrentes.
 
-Decisoes, trade-offs e limitacoes: [`ARCHITECTURE.md`](ARCHITECTURE.md).
+Decisoes, trade-offs, limitacoes e como cada falha eliminatoria e evitada: [`ARCHITECTURE.md`](ARCHITECTURE.md).
+
+**Stack**: Bun 1.4, TypeScript estrito, NestJS 12, MikroORM 7, PostgreSQL 17, SQS (MiniStack), Docker Compose.
 
 ## Requisitos
 
 - [Bun](https://bun.sh) 1.4+
 - Docker com Compose v2
 
-## Subindo
+## Subindo tudo em containers (1 comando)
+
+```bash
+bun install           # so para os scripts auxiliares (smoke, sqs:send)
+bun run stack:up      # Postgres + MiniStack + filas + migrations + 1 API (porta 3000) + 3 workers
+bun run smoke         # verifica ponta a ponta: HTTP, replay, fila, workers, reconciliacao, outbox
+bun run stack:down    # derruba e apaga os volumes
+```
+
+## Desenvolvimento local
 
 ```bash
 bun install
-bun run infra:up   # PostgreSQL (porta 55432) + MiniStack/SQS (porta 4566) + criacao das filas
-bun run db:migrate # aplica as migrations
-bun run start      # API em http://localhost:3000
+bun run infra:up      # PostgreSQL (porta 55432) + MiniStack/SQS (porta 4566) + criacao das filas
+bun run db:migrate    # aplica as migrations
+bun run start         # API em http://localhost:3000 + workers
 ```
 
 Migrations: `bun run db:status`, `bun run db:rollback` (desfaz a ultima), `bun run db:rollback -- --all`.
-
-`bun run infra:down` derruba tudo e apaga os volumes.
+`bun run infra:down` derruba a infraestrutura e apaga os volumes.
 
 ## Testes
 

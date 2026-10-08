@@ -1,5 +1,19 @@
 name: wagering
 
+# Ambiente comum das instancias da aplicacao (perfil "app").
+x-app-env: &app-env
+  DATABASE_URL: postgres://wagering:wagering@postgres:5432/wagering
+  SQS_ENDPOINT: http://sqs:4566
+  AWS_REGION: us-east-1
+  AWS_ACCESS_KEY_ID: test
+  AWS_SECRET_ACCESS_KEY: test
+
+x-app-deps: &app-deps
+  migrate:
+    condition: service_completed_successfully
+  sqs-init:
+    condition: service_completed_successfully
+
 services:
   postgres:
     image: postgres:17-alpine
@@ -37,3 +51,37 @@ services:
     volumes:
       - ./infra/sqs/init.sh:/init.sh:ro
     entrypoint: ["sh", "/init.sh"]
+
+  # ---- Aplicacao (perfil "app"): docker compose --profile app up -d --build ----
+
+  migrate:
+    profiles: [app]
+    build: .
+    command: ["bun", "scripts/migrate.ts", "up"]
+    environment: *app-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # API sem workers, exposta na 3000.
+  api:
+    profiles: [app]
+    build: .
+    environment:
+      <<: *app-env
+      WORKERS: none
+    ports:
+      - "3000:3000"
+    depends_on: *app-deps
+
+  # Tres replicas com consumidor, relay da outbox e worker de referencias:
+  # o cenario de varias instancias concorrentes, de verdade.
+  worker:
+    profiles: [app]
+    build: .
+    environment:
+      <<: *app-env
+      WORKERS: consumer,outbox,references
+    deploy:
+      replicas: 3
+    depends_on: *app-deps
