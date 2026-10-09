@@ -8,7 +8,8 @@
     "infra:up": "docker compose up -d --wait postgres sqs && docker compose run --rm sqs-init",
     "infra:down": "docker compose down -v",
     "typecheck": "tsc --noEmit",
-    "test": "bun test"
+    "test": "bun test",
+    "test:unit": "bun test test/unit"
   },
   "dependencies": {
     "@aws-sdk/client-sqs": "^3.1148.0",

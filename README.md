@@ -4,7 +4,7 @@ Servico financeiro que processa transacoes de apostas (`BET`, `WIN`, `LOSS`, `RE
 vindas de varios provedores, por HTTP e por SQS, mantendo saldo, ledger, inbox e outbox consistentes
 mesmo com mensagens duplicadas, fora de ordem e varias instancias concorrentes.
 
-Decisoes, trade-offs e limitacoes: [`ARCHITECTURE.md`](ARCHITECTURE.md) (em construcao).
+Decisoes, trade-offs e limitacoes: [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ## Requisitos
 
@@ -25,7 +25,8 @@ bun run start      # API em http://localhost:3000
 
 ```bash
 bun run typecheck
-bun test           # exige a infraestrutura de pe: integracao usa Postgres e SQS reais
+bun run test:unit  # so dominio, sem infraestrutura
+bun test           # tudo; exige a infraestrutura de pe: integracao usa Postgres e SQS reais
 ```
 
 ## Filas
