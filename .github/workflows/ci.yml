@@ -8,7 +8,7 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -27,3 +27,26 @@ jobs:
 
       - if: failure()
         run: docker compose logs --no-color
+
+  # A pilha como o avaliador sobe: imagem da aplicacao, migrations, API e 3 workers.
+  stack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+
+      - run: bun install --frozen-lockfile
+
+      - run: bun run stack:up
+
+      - run: bun run smoke
+
+      - if: failure()
+        run: docker compose --profile app logs --no-color
+
+      - if: always()
+        run: bun run stack:down

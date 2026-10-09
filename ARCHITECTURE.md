@@ -1,6 +1,51 @@
 # Arquitetura
 
-Documento vivo: cada fase acrescenta as decisoes que tomou. Secoes marcadas *(a fazer)* ainda nao foram implementadas.
+Decisoes, trade-offs e limitacoes do processador de apostas. Para subir e testar, ver o [README](README.md).
+
+## Visao geral
+
+```mermaid
+flowchart LR
+  P[Provedor] -- "HTTP + Idempotency-Key" --> API
+  P -- "WagerTransactionRequested" --> Q[(wager-transactions.fifo)]
+  Q -- "redrive apos 5 entregas" --> DLQ[(wager-transactions-dlq.fifo)]
+
+  subgraph Instancia["cada instancia (N replicas)"]
+    API[API HTTP]
+    C[Consumidor SQS]
+    R[Relay da outbox]
+    W[Worker de referencias]
+    UC["ProcessWagerTransaction<br/>(mesmo caso de uso)"]
+    API --> UC
+    C --> UC
+  end
+
+  Q --> C
+  C -- "permanente" --> DLQ
+  UC -- "1 transacao SQL:<br/>transacao + saldo + ledger<br/>+ inbox + outbox" --> PG[(PostgreSQL)]
+  R -- "SKIP LOCKED + lease" --> PG
+  W -- "lock da wallet" --> PG
+  R -- "eventos" --> E[(wager-events.fifo)]
+```
+
+```mermaid
+sequenceDiagram
+  participant C as Consumidor
+  participant DB as PostgreSQL
+  participant Q as SQS
+  C->>Q: ReceiveMessage
+  C->>DB: BEGIN
+  C->>DB: SELECT wallet FOR UPDATE
+  C->>DB: inbox ja tem (consumer, messageId)? idempotency key ja existe?
+  alt ja processada
+    DB-->>C: transacao original (replay)
+  else nova
+    C->>DB: INSERT transacao, UPDATE wallet, INSERT ledger, INSERT inbox, INSERT outbox
+  end
+  C->>DB: COMMIT (triggers deferred conferem saldo == ledger)
+  C->>Q: DeleteMessage (ack so depois do commit)
+  Note over C,Q: se o processo morrer entre COMMIT e ack,<br/>a redelivery cai no replay
+```
 
 ## Camadas
 
@@ -9,7 +54,7 @@ src/
   domain/          regras puras: sem NestJS, sem ORM, sem relogio, sem I/O
   application/     casos de uso e portas (TransactionRunner, repositorios, Clock, Metrics); sem NestJS nem ORM
   infrastructure/  MikroORM, SQS, relogio, ids: implementam as portas
-  interfaces/      HTTP (controllers, filtro de erros, auth) e, na fase 4, o consumer SQS
+  interfaces/      HTTP (controllers, filtro de erros, auth), consumidor SQS e ciclo de vida dos workers
   app.module.ts    composicao: o unico lugar que liga portas a implementacoes
 ```
 
@@ -121,7 +166,7 @@ Envelope abstrato `IntegrationEvent<T>` com `eventType` e `version` fixos em cad
 `WagerTransactionProcessed` (inclusive LOSS), `WagerTransactionRejected`, `WagerTransactionPendingReference`
 e `WalletBalanceChanged` (so quando o saldo muda). `data` leva `MoneyProps`, nunca `Money`.
 
-`aggregateId` e a **walletId** em todos: e a unidade de concorrencia e sera o `MessageGroupId` dos eventos
+`aggregateId` e a **walletId** em todos: e a unidade de concorrencia e o `MessageGroupId` dos eventos
 publicados, preservando a ordem por wallet. `OutboxMessage.id` = `eventId`, para o consumidor deduplicar,
 ja que a outbox publica pelo menos uma vez.
 
@@ -365,3 +410,42 @@ inteiro, nao a memoria de uma instancia. Se a fonte falhar, o gauge vira `NaN` s
 
 `/health/live` nao toca dependencias (falha = reiniciar o processo). `/health/ready` checa PostgreSQL e SQS com prazo
 de 2 s cada (falha = tirar do balanceador). Ambos sem autenticacao.
+
+## Entrega
+
+- `docker compose --profile app up -d --build` (ou `bun run stack:up`) sobe tudo: Postgres, MiniStack, criacao das filas,
+  migrations, **1 API** (porta 3000, sem workers) e **3 workers** (consumidor, relay e referencias). E o cenario de
+  varias instancias concorrentes rodando de fato.
+- A imagem roda o TypeScript direto no Bun (sem etapa de build) com dependencias de producao, usuario sem
+  privilegio e `HEALTHCHECK` no `/health/ready`. No `docker stop`, o SIGTERM chega ao Bun (PID 1), os workers param e o
+  processo sai com 0.
+- O CI tem dois jobs: `test` (typecheck + todos os testes com Postgres e SQS reais) e `stack` (sobe a pilha acima e
+  roda `bun run smoke`: HTTP, replay, 3 mensagens pela fila consumidas pelos workers, reconciliacao e outbox vazia).
+
+## Trade-offs e limitacoes
+
+| Decisao / limite | Por que | Custo |
+|---|---|---|
+| Lock pessimista por wallet | sem tempestade de retry em wallet quente; coordenacao no banco, vale para N instancias | operacoes da mesma wallet sao serializadas: o teto de uma wallet e ~1 / duracao da transacao |
+| Checagem saldo == ledger por constraint trigger deferred | a garantia vale para qualquer escrita, nao so para este codigo | uma consulta por indice extra por linha escrita no COMMIT |
+| Uma reversao por referencia, de qualquer tipo | evita creditar duas vezes uma BET (REFUND + ROLLBACK) | mais estrito que a letra do enunciado ("pelo mesmo tipo") |
+| `FAILED` modelado, mas nao produzido | transitorio e retentado; mensagem com erro permanente vai para a DLQ antes de existir transacao gravada | o estado existe (transicoes, constraints, `PROCESSING_FAILED`) para um caminho que hoje nao ocorre |
+| Outbox pelo menos uma vez | lease + SKIP LOCKED: nada se perde com instancia morta | evento pode sair duas vezes (consumidor deduplica por `eventId`); com varios publicadores, ordem por wallet nao e estrita |
+| Inbox sem limpeza | a idempotency key ja e a garantia final; a inbox protege o `messageId` | a tabela cresce; em producao, retencao por idade (a redelivery do SQS nao passa de 14 dias) |
+| Triggers de imutabilidade | valem ate para o dono das tabelas | um superusuario pode desliga-las; em producao, papeis separados para aplicacao e migrations |
+| Autenticacao nao implementada | vale zero pontos | ponto de extensao e desenho Keycloak documentados acima |
+| Uma unica moeda testada de ponta a ponta (BRL) | permitido pelo enunciado | o modelo e multi-moeda (`UNIQUE (player_id, currency)`) e o conflito de moeda e testado; escala fixa de 2 casas |
+| MiniStack no lugar do LocalStack | o SQS do LocalStack Community virou pago | emulador menos difundido; FIFO, dedup, visibilidade e redrive foram verificados antes de adotar |
+
+## Falhas eliminatorias: como cada uma e evitada
+
+| Falha eliminatoria | Como e evitada | Prova |
+|---|---|---|
+| `number` para dinheiro | `Money` em `bigint`; `numeric(20,2)` lido como string; `number` recusado na entrada | `money.test.ts`, `api.test.ts` ("valor como number" = 400) |
+| Saldo negativo por race | `FOR UPDATE` na wallet + `CHECK (balance >= 0)` + checagem no dominio | `concurrency.test.ts`, `cluster.test.ts` (wallet quente, 100 / 80 / 80), `schema.test.ts` |
+| Debito ou credito duplicado | idempotencia conferida sob o lock + `UNIQUE` de key e operacao + inbox + reversao unica por indice | 50x a mesma aposta (1 e 3 processos), redelivery, crash entre commit e ack |
+| Idempotencia so em memoria | tudo em tabela com indice unico | `wagering.test.ts` ("outro processo ve o replay"), `cluster.test.ts` |
+| Correto so com uma instancia | coordenacao no Postgres (lock de linha, `SKIP LOCKED`, indices unicos), nada em memoria | `cluster.test.ts` (3 processos), job `stack` do CI (1 API + 3 workers) |
+| Evento publicado antes do commit | so a outbox grava eventos, na mesma transacao; o relay le o que foi confirmado | `outbox-and-references.test.ts` (commit, processo morre, outra instancia publica) |
+| Ledger nao auditavel | lancamento imutavel por trigger, com `balance_before`/`after` e corrente por versao; reconciliacao | `schema.test.ts`, reconciliacao em todos os testes de integracao |
+| Testes que trocam Postgres e SQS por mock | integracao e multi-processo sempre contra Postgres e MiniStack reais, banco e filas proprios por arquivo | `test/support/database.ts`, `test/support/queues.ts` |
