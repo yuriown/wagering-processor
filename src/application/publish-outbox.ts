@@ -32,17 +32,16 @@ export class PublishOutbox {
 
     const results = await this.publishSafely(claimed);
     const byId = new Map(results.map((r) => [r.id, r]));
-    let published = 0;
+    const ok = claimed.filter((m) => byId.get(m.id)?.ok === true);
+    const marked = new Set(await this.store.markPublished(ok.map((m) => m.id), this.options.owner, this.clock.now()));
+    for (const message of ok) {
+      this.metrics.increment("outbox_published_total", { eventType: message.eventType });
+      if (!marked.has(message.id)) this.metrics.increment("outbox_lease_lost_total");
+    }
     for (const message of claimed) {
       const result = byId.get(message.id) ?? { id: message.id, ok: false, error: "sem resultado do broker" };
+      if (result.ok) continue;
       const now = this.clock.now();
-      if (result.ok) {
-        const mine = await this.store.markPublished(message.id, this.options.owner, now);
-        if (!mine) this.metrics.increment("outbox_lease_lost_total");
-        published += 1;
-        this.metrics.increment("outbox_published_total", { eventType: message.eventType });
-        continue;
-      }
       // O dominio calcula o backoff; aqui so persiste o resultado.
       const retry = OutboxMessage.rehydrate({ ...message, nextAttemptAt: undefined, publishedAt: undefined });
       retry.scheduleRetry(now);
@@ -54,7 +53,7 @@ export class PublishOutbox {
         attempts: retry.attempts,
       });
     }
-    return published;
+    return ok.length;
   }
 
   private async publishSafely(messages: readonly ClaimedOutboxMessage[]): Promise<PublishResult[]> {

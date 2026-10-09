@@ -141,7 +141,7 @@ describe("outbox", () => {
     expect(await pendingEvents()).toBe(0);
 
     // O "morto" volta e tenta marcar: o lease nao e mais dele.
-    expect(await store.markPublished(claimed[0]!.id, "publicador-morto", new Date())).toBe(false);
+    expect(await store.markPublished([claimed[0]!.id], "publicador-morto", new Date())).toEqual([]);
     const [row] = await db.sql`select count(*)::int as count from outbox_messages where aggregate_id = ${wallet.id} and published_at is not null`;
     expect(row.count).toBe(2);
     await drain(queues.sqs, queues.eventsUrl);

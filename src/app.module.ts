@@ -103,7 +103,7 @@ export class AppModule implements NestModule {
         },
         { provide: METRICS, useExisting: PrometheusMetrics },
         { provide: LOGGER, useValue: new JsonLogger("http") },
-        { provide: MikroORM, useFactory: () => MikroORM.init(ormConfig(config.databaseUrl)) },
+        { provide: MikroORM, useFactory: () => MikroORM.init(ormConfig(config.databaseUrl, { pool: { min: 0, max: config.dbPoolMax } })) },
         { provide: SQSClient, useFactory: () => createSqsClient(config.sqs) },
         {
           provide: TRANSACTION_RUNNER,

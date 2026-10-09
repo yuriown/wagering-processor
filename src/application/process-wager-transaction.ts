@@ -91,7 +91,7 @@ export class ProcessWagerTransaction {
       return this.replay(known, payloadHash);
     }
 
-    return this.runner.run(async (uow) => {
+    const outcome = await this.runner.run(async (uow): Promise<WagerOutcome> => {
       const wallet = await uow.wallets.lockById(command.walletId);
       if (wallet === undefined) {
         throw new WalletNotFoundError(`wallet ${command.walletId} nao existe`);
@@ -102,11 +102,14 @@ export class ProcessWagerTransaction {
         const delivered = await this.alreadyDelivered(uow, context.inbox);
         if (delivered !== undefined) return delivered;
       }
-      const existing = await uow.transactions.findByIdempotencyKey(command.providerId, command.idempotencyKey);
+      const { byKey: existing, byOperation: sameOperation } = await uow.transactions.findExisting(
+        command.providerId,
+        command.idempotencyKey,
+        command.externalTransactionId,
+      );
       if (existing !== undefined) {
         return this.replay(existing, payloadHash);
       }
-      const sameOperation = await uow.transactions.findByExternalId(command.providerId, command.externalTransactionId);
       if (sameOperation !== undefined) {
         throw new IdempotencyConflictError(
           `externalTransactionId ${command.externalTransactionId} ja foi enviado com outra Idempotency-Key`,
@@ -158,10 +161,6 @@ export class ProcessWagerTransaction {
       for (const message of this.events.forOutcome(transaction, wallet, entry, context)) {
         uow.outbox.enqueue(message);
       }
-      if (transaction.status === WagerTransactionStatus.Processed) {
-        // Quem esperava por esta operacao (REFUND/ROLLBACK fora de ordem) e reavaliado ja.
-        await uow.transactions.expediteWaitingFor(transaction.providerId, transaction.externalTransactionId, now);
-      }
       if (context.inbox !== undefined) {
         const inbox = InboxMessage.receive({ ...context.inbox, receivedAt: now });
         inbox.markProcessed(now);
@@ -171,6 +170,26 @@ export class ProcessWagerTransaction {
       this.metrics.increment("wager_transactions_total", { kind: transaction.kind, status: transaction.status });
       return { transaction, idempotentReplay: false };
     });
+
+    if (outcome.transaction.status === WagerTransactionStatus.Processed && !outcome.idempotentReplay) {
+      await this.expediteWaiting(outcome.transaction);
+    }
+    return outcome;
+  }
+
+  /**
+   * Quem esperava por esta operacao (REFUND/ROLLBACK fora de ordem) e reavaliado ja, sem esperar o backoff.
+   * Fica fora da transacao de proposito: nao segura o lock da wallet, e falhar aqui so atrasa a reavaliacao
+   * (o worker acha a pendencia pelo agendamento), nunca a corrompe.
+   */
+  private async expediteWaiting(transaction: WagerTransaction): Promise<void> {
+    try {
+      await this.runner.read((uow) =>
+        uow.transactions.expediteWaitingFor(transaction.providerId, transaction.externalTransactionId, this.clock.now()),
+      );
+    } catch {
+      // Melhor esforco: ver comentario acima.
+    }
   }
 
   private async alreadyDelivered(uow: UnitOfWork, inbox: InboxContext): Promise<WagerOutcome | undefined> {
