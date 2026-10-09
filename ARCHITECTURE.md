@@ -7,9 +7,10 @@ Documento vivo: cada fase acrescenta as decisoes que tomou. Secoes marcadas *(a 
 ```
 src/
   domain/          regras puras: sem NestJS, sem ORM, sem relogio, sem I/O
-  application/     casos de uso; orquestram dominio e portas        (a fazer)
-  infrastructure/  MikroORM, SQS, metricas: implementam as portas    (a fazer)
-  interfaces/      HTTP (controllers) e SQS (consumer)
+  application/     casos de uso e portas (TransactionRunner, repositorios, Clock, Metrics); sem NestJS nem ORM
+  infrastructure/  MikroORM, SQS, relogio, ids: implementam as portas
+  interfaces/      HTTP (controllers, filtro de erros, auth) e, na fase 4, o consumer SQS
+  app.module.ts    composicao: o unico lugar que liga portas a implementacoes
 ```
 
 O dominio recebe ids e horario de fora (`at: Date`, `entryId`, `eventId`). Isso o torna deterministico:
@@ -165,8 +166,95 @@ pode desliga-las. Em producao, a aplicacao usaria um papel sem `TRIGGER`/`TRUNCA
 Os testes de integracao (`test/integration/schema.test.ts`) violam cada linha desta tabela direto em SQL,
 sem passar pelo dominio, e provam que `down` total remove tudo e `up` recria.
 
-## A fazer nas proximas fases
+## ORM: MikroORM e mapeamento
 
-- Estrategia transacional e de lock (fase 3).
-- Consumer SQS, outbox e workers (fase 4).
-- Autenticacao: nao implementada; desenho e ponto de extensao (fase 3).
+- **MikroORM 7** (preferencial no enunciado): Unit of Work e Identity Map explicitos, `em.transactional()` e
+  `LockMode.PESSIMISTIC_WRITE`.
+- Mapeamento por `EntitySchema`, sem decorators, sobre **registros de persistencia** (`records.ts`) separados das
+  classes de dominio. Os mapeadores (`mappers.ts`) reidratam o dominio com `rehydrate` e copiam o estado de volta.
+  Assim o dominio nao tem construtor publico, decorator nem tipo do ORM.
+- **Money no banco**: `numeric(20,2)` lido pelo `DecimalType` em modo string. A string vai direto para `Money.from`.
+  Valor e moeda em colunas separadas.
+- As relacoes (`wallet`, `transaction`, `referenceTransaction`) estao declaradas so para o Unit of Work ordenar os
+  INSERTs no flush (wallet -> transacao -> lancamento). O dominio continua falando em ids.
+
+## Estrategia transacional e concorrencia
+
+**Unidade de concorrencia: a wallet.** O caso de uso `ProcessWagerTransaction` (o mesmo para HTTP e SQS):
+
+1. **Caminho rapido sem lock**: procura a idempotency key. Se existir, e replay ou conflito, sem transacao de escrita.
+2. Abre a transacao (READ COMMITTED) e trava a wallet: `SELECT ... FOR UPDATE` (`lockById`).
+3. **Com o lock na mao, confere a idempotencia de novo.** Quem esperou pelo lock ve o que o anterior confirmou e
+   responde replay. E isso que faz 50 envios simultaneos da mesma aposta resultarem num unico debito.
+4. Resolve a referencia, aplica as regras do dominio e registra transacao, saldo, lancamento, inbox e eventos.
+5. Um unico flush e COMMIT. As constraint triggers deferred conferem saldo == ledger nesse momento.
+
+**Por que lock pessimista e nao otimista.** Numa wallet disputada (muitas apostas do mesmo jogador), lock otimista
+vira tempestade de retry: todos leem a versao N e so um grava. Com `FOR UPDATE`, a fila se forma no Postgres, cada
+operacao espera a vez uma unica vez e nao ha retry. O lock e de uma linha, entao wallets diferentes nao se
+bloqueiam (testado), e funciona igual com qualquer numero de instancias, porque quem coordena e o banco. Cada
+transacao trava uma unica wallet, entao nao ha ordem de lock a respeitar e nao ha deadlock entre wallets.
+
+**`version`** continua existindo e sobe a cada mudanca de saldo, mas nao e o mecanismo de controle: serve de
+corrente do ledger (`UNIQUE (wallet_id, wallet_version)`), que e outra barreira contra lost update.
+
+**Corridas que o lock nao cobre** (a mesma key enviada para wallets diferentes, duas criacoes da mesma wallet) sao
+decididas pelos indices unicos. O perdedor recebe `UniqueViolationError`, o caso de uso tenta mais uma vez e cai
+no replay ou no conflito, como uma requisicao normal.
+
+**Espera limitada**: `SET LOCAL lock_timeout` (5 s, configuravel). Esgotado, a resposta e 503 com `Retry-After`,
+sem efeito parcial. O SQLSTATE 55P03 e classificado direto: o MikroORM o entrega como excecao generica, e sem isso
+o provedor receberia 500 e nao saberia que pode reenviar.
+
+**Reconciliacao** le wallet e ledger no mesmo snapshot (REPEATABLE READ, somente leitura), para um lancamento
+confirmado no meio da conta nao gerar falsa divergencia.
+
+## Idempotencia: fluxo
+
+| Situacao | Resultado |
+|---|---|
+| Key nova | processa |
+| Key existente, mesmo `payloadHash` | replay: mesmo corpo, `idempotentReplay: true`, saldo daquele momento |
+| Key existente, hash diferente | 409 `IDEMPOTENCY_CONFLICT` |
+| `(providerId, externalTransactionId)` existente com outra key | 409 `IDEMPOTENCY_CONFLICT` |
+| Mensagem SQS ja recebida (inbox) | replay da transacao registrada |
+| Mesmo `messageId` com conteudo diferente | `MESSAGE_ID_CONFLICT` (mensagem invalida, vai para a DLQ) |
+
+Tudo persistente no Postgres; nada depende de memoria do processo.
+
+## API HTTP: status
+
+| Situacao | Status | Corpo |
+|---|---|---|
+| Transacao processada | 201 | `{ transactionId, status, balance, idempotentReplay: false }` |
+| Replay de processada | 200 | o mesmo, com `idempotentReplay: true` |
+| Aceita aguardando referencia | 202 | `status: PENDING_REFERENCE` |
+| Rejeitada por regra de negocio (e seu replay) | 422 | `status: REJECTED`, `failureCode` |
+| Payload invalido, header ausente, JSON malformado | 400 | `error.code = VALIDATION_FAILED`, `details` por campo |
+| Conflito de idempotencia | 409 | `IDEMPOTENCY_CONFLICT` |
+| Wallet duplicada | 409 | `WALLET_ALREADY_EXISTS` |
+| Wallet ou transacao inexistente | 404 | `WALLET_NOT_FOUND` / `TRANSACTION_NOT_FOUND` |
+| Falha transitoria (banco fora, lock timeout, deadlock) | 503 + `Retry-After` | `TEMPORARILY_UNAVAILABLE` |
+| Erro inesperado | 500 | `INTERNAL_ERROR` |
+
+Erros sempre como `{ "error": { "code", "message", "details"? } }`. A regra pratica para o provedor:
+**503 reenvia igual; 4xx nao reenvia igual.** Os endpoints GET seguem os mesmos codigos.
+
+## Autenticacao
+
+**Nao implementada**: vale zero pontos e competiria com o que vale. O ponto de extensao esta no codigo:
+
+- `ProviderIdentityPort` (`src/interfaces/http/auth.ts`) resolve a identidade de quem chama. Hoje a implementacao e
+  `UnauthenticatedProviderIdentity`, que nao afirma provedor nenhum.
+- `ProviderAuthGuard` e global. Health checks sao `@Public()`.
+- `assertActsAsProvider` ja compara o provedor autenticado com o `providerId` do corpo e da rota (403
+  `PROVIDER_MISMATCH`). Com a implementacao no-op, nunca dispara.
+
+**Desenho adotado se fosse implementar**: Keycloak no compose, um client confidencial por provedor com
+`client_credentials`, e uma claim `provider_id` no access token. A implementacao do port validaria o JWT (assinatura
+pelo JWKS do realm, `iss`, `aud`, `exp`) e devolveria `provider_id`. Mensagens da fila sao canal interno confiavel,
+mas o `providerId` delas passa pelas mesmas validacoes de dominio.
+
+## A fazer nas proximas fases
+- Consumer SQS, publicador da outbox e worker de referencias pendentes (fase 4).
+- Metricas reais (hoje `NoopMetrics`) e logs com correlacao automatica (fase 6).

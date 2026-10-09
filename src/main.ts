@@ -1,13 +1,9 @@
-import "reflect-metadata";
-import { NestFactory } from "@nestjs/core";
-import { AppModule } from "./app.module";
 import { loadConfig } from "./config";
+import { createHttpApp } from "./http-app";
 
 async function bootstrap(): Promise<void> {
   const config = loadConfig();
-  const app = await NestFactory.create(AppModule);
-  // Repassa SIGTERM/SIGINT aos hooks onModuleDestroy/beforeApplicationShutdown.
-  app.enableShutdownHooks();
+  const app = await createHttpApp(config);
   await app.listen(config.port);
 }
 
