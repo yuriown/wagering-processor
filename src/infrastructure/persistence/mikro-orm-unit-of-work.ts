@@ -7,7 +7,7 @@ import {
   UniqueConstraintViolationException,
 } from "@mikro-orm/core";
 import type { EntityManager, MikroORM } from "@mikro-orm/postgresql";
-import { TransientInfrastructureError, UniqueViolationError } from "../../application/errors";
+import { IntegrityViolationError, TransientInfrastructureError, UniqueViolationError } from "../../application/errors";
 import type {
   Clock,
   InboxRepository,
@@ -113,6 +113,10 @@ export function translateDriverError(error: unknown): unknown {
   }
   if (state === "57014") {
     return new TransientInfrastructureError("consulta cancelada por tempo", "timeout", { cause: error });
+  }
+  // Classe 23 (integridade) alem da unicidade: CHECK, FK, triggers do ledger, saldo == ledger no COMMIT.
+  if (state !== undefined && state.startsWith("23")) {
+    return new IntegrityViolationError(`banco recusou a escrita: ${(error as Error).message}`, state, { cause: error });
   }
   return error;
 }

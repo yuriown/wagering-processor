@@ -93,6 +93,10 @@ PENDING ──────────► PENDING_REFERENCE
 PENDING_REFERENCE ► PENDING_REFERENCE (nova tentativa) | PROCESSED | REJECTED | FAILED
 ```
 
+**REJECTED x FAILED.** REJECTED e uma regra de negocio dizendo nao (saldo insuficiente, referencia invalida): o pedido
+e que estava errado. FAILED e o sistema que nao conseguiu concluir uma transacao ja registrada, e tentar de novo nao
+resolve. Hoje isso acontece num unico lugar: o worker de referencias pendentes (secao propria, abaixo).
+
 PROCESSED, REJECTED e FAILED sao terminais. Tentar transicionar a partir deles lanca `InvalidTransactionStateError`
 (erro de programacao, nao de negocio). A liquidacao recusa transacao terminal **antes** de tocar a wallet:
 um teste pegou o caso em que a wallet era debitada e so depois a transicao falhava.
@@ -143,7 +147,7 @@ atraso normais de fila sem deixar a transacao pendurada por horas. Esgotado o li
 | `AMOUNT_MISMATCH` | corrigir | reversao com valor diferente da referencia |
 | `CURRENCY_MISMATCH` | corrigir | moeda diferente da wallet |
 | `WALLET_PLAYER_MISMATCH` | corrigir | wallet de outro player |
-| `PROCESSING_FAILED` | desistir | erro permanente de infraestrutura (FAILED) |
+| `PROCESSING_FAILED` | desistir | transacao pendente que nao pode ser concluida: o banco recusou por integridade ou uma invariante quebrou (FAILED) |
 
 Toda rejeicao e terminal para aquela idempotency key: reenviar devolve a mesma rejeicao. "Nova transacao"
 e "corrigir" significam enviar outra operacao, com outro `externalTransactionId`.
@@ -332,7 +336,7 @@ cliente SQS serem fechados (`onApplicationShutdown`).
 | Falha | Exemplos | O que acontece |
 |---|---|---|
 | **negocio** (terminal) | wallet inexistente, conflito de idempotencia | ack + log + metrica |
-| **permanente** | JSON invalido, tipo desconhecido, payload invalido, `messageId` reusado | envia para a DLQ com o motivo nos atributos, depois ack |
+| **permanente** | JSON invalido, tipo desconhecido, payload invalido, `messageId` reusado, banco recusando por integridade | envia para a DLQ com o motivo nos atributos, depois ack |
 | **transitoria** | banco fora, lock timeout, erro desconhecido | sem ack; `ChangeMessageVisibility` com backoff exponencial (2 s .. 60 s) |
 
 Transitoria repetida: depois de `maxReceiveCount` (5) entregas, o **redrive da propria fila** move para a DLQ. Erro
@@ -373,6 +377,12 @@ por wallet, ao custo de paralelismo.
 - Quando a referencia chega, `expediteWaitingFor` antecipa a verificacao das dependentes para "agora", logo depois
   do COMMIT e fora do lock: nao e preciso esperar o backoff. Se essa antecipacao falhar, nada se perde, so espera.
 - Esgotadas as tentativas (8, ~15 min): `REJECTED` com `REFERENCE_NOT_FOUND` e `WagerTransactionRejected`.
+- **Falha permanente vira FAILED.** Se a reavaliacao falhar com um erro que se repete (o banco recusou por integridade,
+  ou o dominio detectou uma invariante quebrada), a tentativa e desfeita e, numa transacao separada que nao toca o
+  saldo, a transacao vai para `FAILED` com `PROCESSING_FAILED`: terminal, com data, log de erro e metrica, e sai da
+  fila. Sem isso, a pendencia "venenosa" voltaria primeiro em toda varredura (a fila e por vencimento) e travaria todas
+  as outras para sempre. Falha transitoria (banco fora) so pula aquela pendencia na varredura; as demais seguem.
+  Testado com uma wallet de saldo corrompido na mesma varredura de uma saudavel.
 
 ## Observabilidade
 
@@ -435,7 +445,7 @@ de 2 s cada (falha = tirar do balanceador). Ambos sem autenticacao.
 | Lock pessimista por wallet | sem tempestade de retry em wallet quente; coordenacao no banco, vale para N instancias | operacoes da mesma wallet sao serializadas: ~40 req/s numa unica wallet no notebook do teste de carga |
 | Checagem saldo == ledger por constraint trigger deferred | a garantia vale para qualquer escrita, nao so para este codigo | uma consulta por indice extra por linha escrita no COMMIT |
 | Uma reversao por referencia, de qualquer tipo | evita creditar duas vezes uma BET (REFUND + ROLLBACK) | mais estrito que a letra do enunciado ("pelo mesmo tipo") |
-| `FAILED` modelado, mas nao produzido | transitorio e retentado; mensagem com erro permanente vai para a DLQ antes de existir transacao gravada | o estado existe (transicoes, constraints, `PROCESSING_FAILED`) para um caminho que hoje nao ocorre |
+| `FAILED` so no worker de referencias | num pedido novo, uma falha desfaz a transacao inteira: nao existe linha para marcar (o erro vira 500 ou DLQ) | um pedido novo que falha de forma permanente nao fica registrado como FAILED; fica no log, na metrica e na DLQ |
 | Outbox pelo menos uma vez | lease + SKIP LOCKED: nada se perde com instancia morta | evento pode sair duas vezes (consumidor deduplica por `eventId`); com varios publicadores, ordem por wallet nao e estrita |
 | Inbox sem limpeza | a idempotency key ja e a garantia final; a inbox protege o `messageId` | a tabela cresce; em producao, retencao por idade (a redelivery do SQS nao passa de 14 dias) |
 | Triggers de imutabilidade | valem ate para o dono das tabelas | um superusuario pode desliga-las; em producao, papeis separados para aplicacao e migrations |

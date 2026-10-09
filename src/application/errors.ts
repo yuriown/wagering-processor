@@ -68,6 +68,24 @@ export class TransientInfrastructureError extends ApplicationError {
   }
 }
 
+/**
+ * O banco recusou a escrita por violar uma garantia de integridade (CHECK, FK, trigger do ledger,
+ * checagem saldo == ledger no COMMIT). Nao e corrida nem indisponibilidade: repetir da o mesmo
+ * resultado. Indica bug ou dado corrompido; e permanente.
+ */
+export class IntegrityViolationError extends ApplicationError {
+  readonly code = "INTEGRITY_VIOLATION";
+
+  constructor(
+    message: string,
+    readonly sqlState: string,
+    options?: { cause?: unknown },
+  ) {
+    super(message);
+    if (options?.cause !== undefined) this.cause = options.cause;
+  }
+}
+
 /** Corrida perdida contra outra instancia num indice unico; o caso de uso tenta de novo e cai no replay. */
 export class UniqueViolationError extends ApplicationError {
   readonly code = "UNIQUE_VIOLATION";

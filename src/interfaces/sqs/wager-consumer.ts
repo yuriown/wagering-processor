@@ -9,6 +9,7 @@ import {
 import {
   IdempotencyConflictError,
   InboxConflictError,
+  IntegrityViolationError,
   ValidationError,
   WalletNotFoundError,
 } from "../../application/errors";
@@ -44,7 +45,8 @@ export type FailureKind = "business" | "transient" | "permanent";
 
 /**
  * - business: regra de negocio que nao muda com nova tentativa -> ack (terminal).
- * - permanent: a mensagem esta errada (formato, messageId reusado, bug de invariante) -> DLQ ja.
+ * - permanent: a mensagem esta errada (formato, messageId reusado) ou o banco recusou por integridade
+ *   (bug ou dado corrompido): repetir nao muda nada -> DLQ ja.
  * - transient: o resto (banco fora, lock timeout, erro desconhecido) -> devolve com backoff;
  *   esgotado o maxReceiveCount, o redrive da fila manda para a DLQ.
  */
@@ -52,6 +54,7 @@ export function classifyFailure(error: unknown): FailureKind {
   if (error instanceof WalletNotFoundError || error instanceof IdempotencyConflictError) return "business";
   if (
     error instanceof ValidationError ||
+    error instanceof IntegrityViolationError ||
     error instanceof InboxConflictError ||
     error instanceof DomainError ||
     error instanceof InvariantViolationError
