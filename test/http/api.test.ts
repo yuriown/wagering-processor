@@ -11,7 +11,7 @@ let base: string;
 
 beforeAll(async () => {
   db = await createTestDatabase();
-  app = await createHttpApp({ ...loadConfig(), databaseUrl: db.url }, { logger: false });
+  app = await createHttpApp({ ...loadConfig(), databaseUrl: db.url, workers: [] }, { logger: false });
   await app.listen(0, "127.0.0.1");
   base = (await app.getUrl()).replace("[::1]", "127.0.0.1");
 });

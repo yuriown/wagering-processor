@@ -85,6 +85,50 @@ export interface TransactionRunner {
   read<T>(work: (uow: UnitOfWork) => Promise<T>): Promise<T>;
 }
 
+/** Transacao PENDING_REFERENCE cuja proxima verificacao ja venceu. */
+export interface DuePendingReference {
+  transactionId: string;
+  walletId: string;
+}
+
+export interface PendingReferenceFinder {
+  findDue(now: Date, limit: number): Promise<DuePendingReference[]>;
+}
+
+/** Evento reivindicado por um publicador, com prazo de posse (lease). */
+export interface ClaimedOutboxMessage {
+  id: string;
+  aggregateId: string;
+  eventType: string;
+  payload: Readonly<Record<string, unknown>>;
+  occurredAt: Date;
+  attempts: number;
+}
+
+export interface OutboxStore {
+  /**
+   * Reivindica ate `limit` eventos pendentes e vencidos que ninguem detem (ou cujo lease expirou),
+   * em ordem de ocorrencia. Publicadores concorrentes nunca recebem o mesmo evento ao mesmo tempo.
+   */
+  claim(owner: string, limit: number, leaseMs: number): Promise<ClaimedOutboxMessage[]>;
+  /** Marca publicado se o lease ainda for deste dono; devolve false se outro ja assumiu. */
+  markPublished(id: string, owner: string, at: Date): Promise<boolean>;
+  /** Devolve o evento para a fila de pendentes, com nova tentativa agendada. */
+  reschedule(id: string, owner: string, attempts: number, nextAttemptAt: Date, error: string): Promise<void>;
+  /** Idade do evento pendente mais antigo, em ms (0 se nao houver). */
+  oldestPendingAgeMs(now: Date): Promise<number>;
+}
+
+export interface PublishResult {
+  id: string;
+  ok: boolean;
+  error?: string | undefined;
+}
+
+export interface EventPublisher {
+  publish(messages: readonly ClaimedOutboxMessage[]): Promise<PublishResult[]>;
+}
+
 export interface Metrics {
   increment(name: string, labels?: Record<string, string>, value?: number): void;
   observe(name: string, value: number, labels?: Record<string, string>): void;

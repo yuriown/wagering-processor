@@ -53,12 +53,31 @@ curl -X POST localhost:3000/wallets -H 'content-type: application/json' \
   -d '{"playerId":"0192f28f-5dc0-7d58-bdb2-814ad6a0f4a1","initialBalance":{"amount":"1000.00","currency":"BRL"}}'
 ```
 
-## Filas
+## Filas e workers
 
 | Fila | Papel |
 |---|---|
-| `wager-transactions.fifo` | entrada de `WagerTransactionRequested` |
-| `wager-transactions-dlq.fifo` | mensagens que esgotaram as tentativas (`maxReceiveCount` = 5) |
+| `wager-transactions.fifo` | entrada de `WagerTransactionRequested` (`MessageGroupId` = walletId) |
+| `wager-transactions-dlq.fifo` | mensagens invalidas ou que esgotaram as tentativas (`maxReceiveCount` = 5) |
+| `wager-events.fifo` | eventos de integracao publicados pela outbox |
+
+`bun run start` sobe a API e os workers (`consumer`, `outbox`, `references`). Para separar papeis entre instancias:
+`WORKERS=consumer,outbox` ou `WORKERS=none`.
+
+Enviar uma transacao pela fila, como um provedor:
+
+```bash
+bun run sqs:send -- <walletId> <playerId> BET 25.00
+```
+
+| Variavel | Padrao | |
+|---|---|---|
+| `DATABASE_URL` | `postgres://wagering:wagering@localhost:55432/wagering` | |
+| `SQS_ENDPOINT` | `http://localhost:4566` | MiniStack |
+| `WORKERS` | `consumer,outbox,references` | `none` desliga |
+| `SQS_CONSUMERS` | `2` | loops de long polling por instancia |
+| `LOCK_TIMEOUT_MS` | `5000` | espera pelo lock da wallet antes de 503 |
+| `OUTBOX_LEASE_MS` | `30000` | prazo para um publicador concluir o lote |
 
 O SQS e emulado pelo [MiniStack](https://ministack.org), compativel com a API do LocalStack:
 o SQS do LocalStack Community passou para o plano pago.
