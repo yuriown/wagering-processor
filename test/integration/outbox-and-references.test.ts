@@ -3,6 +3,7 @@ import type { ClaimedOutboxMessage, EventPublisher, PublishResult } from "../../
 import { PublishOutbox } from "../../src/application/publish-outbox";
 import { PendingReferenceSweep, ResolvePendingReference } from "../../src/application/resolve-pending-reference";
 import { EventFactory } from "../../src/application/event-factory";
+import { TransientInfrastructureError } from "../../src/application/errors";
 import { FailureCode } from "../../src/domain/wagering/failure-code";
 import { WagerTransactionStatus } from "../../src/domain/wagering/wager-transaction";
 import { SqsEventPublisher } from "../../src/infrastructure/messaging/sqs-event-publisher";
@@ -152,10 +153,11 @@ describe("worker de referencias pendentes", () => {
   function resolver(maxAttempts?: number) {
     const ids = new UuidV7Generator();
     const clock = new SystemClock();
-    return new ResolvePendingReference(app.runner, ids, clock, new EventFactory(ids, clock), app.metrics, maxAttempts);
+    return new ResolvePendingReference(app.runner, ids, clock, new EventFactory(ids, clock), app.metrics, app.logger, maxAttempts);
   }
 
-  const sweep = (r = resolver()) => new PendingReferenceSweep(new SqlPendingReferenceFinder(db.orm), r, new SystemClock());
+  const sweep = (r = resolver()) =>
+    new PendingReferenceSweep(new SqlPendingReferenceFinder(db.orm), r, new SystemClock(), app.logger);
 
   async function statusOf(transactionId: string) {
     const [row] = await db.sql`select status, failure_code, reference_attempts from wager_transactions where id = ${transactionId}`;
@@ -205,6 +207,82 @@ describe("worker de referencias pendentes", () => {
        where payload -> 'data' ->> 'transactionId' = ${refund.transaction.id} and event_type = 'WagerTransactionRejected'`;
     expect(event.code).toBe("REFERENCE_NOT_FOUND");
     expect(await expectLedgerConsistent(db.sql, wallet.id)).toBe("100.00");
+  });
+
+  test("falha permanente vira FAILED auditavel e nao trava as outras pendencias da varredura", async () => {
+    // Wallet A: REFUND esperando a BET; a BET chega (A fica na frente da fila de vencidas).
+    const a = await openWallet(app, "100.00");
+    const refundA = await app.process.execute(
+      command(a, "REFUND", "30.00", { referenceExternalTransactionId: "bet-a" }),
+      ctx(),
+    );
+    await app.process.execute(command(a, "BET", "30.00", { externalTransactionId: "bet-a" }), ctx());
+    // Wallet B: o mesmo, saudavel, vencendo depois de A.
+    const b = await openWallet(app, "100.00");
+    const refundB = await app.process.execute(
+      command(b, "REFUND", "40.00", { referenceExternalTransactionId: "bet-b" }),
+      ctx(),
+    );
+    await app.process.execute(command(b, "BET", "40.00", { externalTransactionId: "bet-b" }), ctx());
+
+    // Corrompe o saldo de A por fora (so superusuario, triggers desligados): o ledger diz 70, a wallet diz 999.
+    await db.sql.begin(async (tx) => {
+      await tx`set local session_replication_role = replica`;
+      await tx`update wallets set balance = 999 where id = ${a.id}`;
+    });
+    const before = app.metrics.count("pending_reference_resolutions_total", { result: "failed" });
+
+    await sweep().runOnce();
+
+    // A: o banco recusou o lancamento (quebraria a corrente do ledger). Tentar de novo daria o mesmo erro.
+    expect(await statusOf(refundA.transaction.id)).toMatchObject({ status: "FAILED", failure_code: FailureCode.ProcessingFailed });
+    const [failed] = await db.sql`
+      select processed_at is not null as decided, next_reference_check_at from wager_transactions where id = ${refundA.transaction.id}`;
+    expect(failed).toEqual({ decided: true, next_reference_check_at: null });
+    const [{ entries }] = await db.sql`select count(*)::int as entries from wallet_ledger_entries where transaction_id = ${refundA.transaction.id}`;
+    expect(entries).toBe(0);
+    expect(app.metrics.count("pending_reference_resolutions_total", { result: "failed" })).toBe(before + 1);
+    expect(app.logger.lines.some((l) => l.level === "error" && l.message.includes("FAILED"))).toBe(true);
+    // Consultavel pela API de leitura, com o codigo estavel.
+    expect((await app.queries.getTransaction(refundA.transaction.id)).failureCode).toBe(FailureCode.ProcessingFailed);
+
+    // B: resolvida na mesma varredura, mesmo vindo depois da que falhou.
+    expect(await statusOf(refundB.transaction.id)).toMatchObject({ status: "PROCESSED" });
+    expect(await expectLedgerConsistent(db.sql, b.id)).toBe("100.00");
+
+    // A nao volta na proxima varredura: FAILED e terminal.
+    const due = await new SqlPendingReferenceFinder(db.orm).findDue(new Date(Date.now() + 3_600_000), 1_000);
+    expect(due.map((d) => d.transactionId)).not.toContain(refundA.transaction.id);
+  });
+
+  test("falha transitoria numa pendencia nao bloqueia as outras e a mantem pendente", async () => {
+    const a = await openWallet(app, "100.00");
+    const refundA = await app.process.execute(
+      command(a, "REFUND", "10.00", { referenceExternalTransactionId: "bet-ta" }),
+      ctx(),
+    );
+    await app.process.execute(command(a, "BET", "10.00", { externalTransactionId: "bet-ta" }), ctx());
+    const b = await openWallet(app, "100.00");
+    const refundB = await app.process.execute(
+      command(b, "REFUND", "10.00", { referenceExternalTransactionId: "bet-tb" }),
+      ctx(),
+    );
+    await app.process.execute(command(b, "BET", "10.00", { externalTransactionId: "bet-tb" }), ctx());
+
+    const real = resolver();
+    const flaky = {
+      execute: (transactionId: string, walletId: string) =>
+        transactionId === refundA.transaction.id
+          ? Promise.reject(new TransientInfrastructureError("banco fora", "connection"))
+          : real.execute(transactionId, walletId),
+    } as unknown as ResolvePendingReference;
+    await new PendingReferenceSweep(new SqlPendingReferenceFinder(db.orm), flaky, new SystemClock(), app.logger).runOnce();
+
+    expect(await statusOf(refundA.transaction.id)).toMatchObject({ status: "PENDING_REFERENCE" });
+    expect(await statusOf(refundB.transaction.id)).toMatchObject({ status: "PROCESSED" });
+    // Na varredura seguinte, com o banco de volta, A e resolvida.
+    await sweep().runOnce();
+    expect(await statusOf(refundA.transaction.id)).toMatchObject({ status: "PROCESSED" });
   });
 
   test("varios workers sobre a mesma pendencia: aplicada uma vez so", async () => {

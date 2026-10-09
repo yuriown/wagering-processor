@@ -175,13 +175,13 @@ export class AppModule implements NestModule {
           provide: ResolvePendingReference,
           inject: [TRANSACTION_RUNNER, ID_GENERATOR, CLOCK, EventFactory, METRICS],
           useFactory: (runner: TransactionRunner, ids: IdGenerator, clock: Clock, events: EventFactory, metrics: Metrics) =>
-            new ResolvePendingReference(runner, ids, clock, events, metrics),
+            new ResolvePendingReference(runner, ids, clock, events, metrics, new JsonLogger("pending-references")),
         },
         {
           provide: PendingReferenceSweep,
           inject: [PENDING_REFERENCE_FINDER, ResolvePendingReference, CLOCK],
           useFactory: (finder: PendingReferenceFinder, resolver: ResolvePendingReference, clock: Clock) =>
-            new PendingReferenceSweep(finder, resolver, clock),
+            new PendingReferenceSweep(finder, resolver, clock, new JsonLogger("pending-references")),
         },
         {
           provide: WagerTransactionConsumer,
