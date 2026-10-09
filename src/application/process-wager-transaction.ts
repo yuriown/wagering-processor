@@ -10,6 +10,7 @@ import {
   WalletNotFoundError,
 } from "./errors";
 import type { EventFactory } from "./event-factory";
+import { annotateLogContext } from "./log-context";
 import type { Clock, IdGenerator, Metrics, RequestContext, TransactionRunner, UnitOfWork } from "./ports";
 import type { WagerCommand } from "./wager-command";
 
@@ -55,13 +56,21 @@ export class ProcessWagerTransaction {
   ) {}
 
   async execute(command: WagerCommand, context: ProcessContext): Promise<WagerOutcome> {
+    const source = context.inbox ? "sqs" : "http";
+    const started = performance.now();
+    annotateLogContext({ providerId: command.providerId, walletId: command.walletId });
     const payloadHash = wagerPayloadHash(command);
     for (let attempt = 1; ; attempt++) {
       try {
         const outcome = await this.attempt(command, payloadHash, context);
+        annotateLogContext({ transactionId: outcome.transaction.id });
         if (outcome.idempotentReplay) {
-          this.metrics.increment("wager_duplicates_total", { source: context.inbox ? "sqs" : "http" });
+          this.metrics.increment("wager_duplicates_total", { source });
         }
+        this.metrics.observe("wager_processing_seconds", (performance.now() - started) / 1000, {
+          source,
+          status: outcome.idempotentReplay ? "REPLAY" : outcome.transaction.status,
+        });
         return outcome;
       } catch (error) {
         if (error instanceof UniqueViolationError && attempt < MAX_ATTEMPTS) {

@@ -1,5 +1,12 @@
 import { SQSClient } from "@aws-sdk/client-sqs";
-import { type DynamicModule, type MiddlewareConsumer, Module, type NestModule, type OnApplicationShutdown } from "@nestjs/common";
+import {
+  type DynamicModule,
+  Inject,
+  type MiddlewareConsumer,
+  Module,
+  type NestModule,
+  type OnApplicationShutdown,
+} from "@nestjs/common";
 import { APP_FILTER, APP_GUARD } from "@nestjs/core";
 import { MikroORM } from "@mikro-orm/postgresql";
 import { CreateWallet } from "./application/create-wallet";
@@ -27,11 +34,15 @@ import { SqsEventPublisher } from "./infrastructure/messaging/sqs-event-publishe
 import { MikroOrmTransactionRunner } from "./infrastructure/persistence/mikro-orm-unit-of-work";
 import { ormConfig } from "./infrastructure/persistence/orm.config";
 import { SqlOutboxStore, SqlPendingReferenceFinder } from "./infrastructure/persistence/sql-outbox-store";
-import { JsonLogger, NoopMetrics, SystemClock, UuidV7Generator } from "./infrastructure/system";
+import { operationalGauges } from "./infrastructure/observability/gauges";
+import { JsonLogger } from "./infrastructure/observability/json-logger";
+import { PrometheusMetrics } from "./infrastructure/observability/prometheus-metrics";
+import { SystemClock, UuidV7Generator } from "./infrastructure/system";
 import { PROVIDER_IDENTITY, ProviderAuthGuard, UnauthenticatedProviderIdentity } from "./interfaces/http/auth";
 import { correlationMiddleware } from "./interfaces/http/correlation";
 import { HealthController } from "./interfaces/http/health.controller";
 import { HttpErrorFilter } from "./interfaces/http/http-error.filter";
+import { MetricsController } from "./interfaces/http/metrics.controller";
 import { WageringController } from "./interfaces/http/wagering.controller";
 import { WalletsController } from "./interfaces/http/wallets.controller";
 import { type ConsumerHooks, WagerTransactionConsumer } from "./interfaces/sqs/wager-consumer";
@@ -68,23 +79,37 @@ class ResourceCloser implements OnApplicationShutdown {
  */
 @Module({})
 export class AppModule implements NestModule {
+  constructor(
+    @Inject(LOGGER) private readonly logger: AppLogger,
+    @Inject(METRICS) private readonly metrics: Metrics,
+  ) {}
+
   static forRoot(config: AppConfig): DynamicModule {
     return {
       module: AppModule,
-      controllers: [HealthController, WalletsController, WageringController],
+      controllers: [HealthController, MetricsController, WalletsController, WageringController],
       providers: [
         { provide: APP_CONFIG, useValue: config },
         { provide: CLOCK, useClass: SystemClock },
         { provide: ID_GENERATOR, useClass: UuidV7Generator },
-        { provide: METRICS, useClass: NoopMetrics },
+        {
+          provide: PrometheusMetrics,
+          inject: [MikroORM, SQSClient, QueueUrls],
+          useFactory: (orm: MikroORM, sqs: SQSClient, urls: QueueUrls) => {
+            const metrics = new PrometheusMetrics({ instanceId: config.instanceId });
+            for (const gauge of operationalGauges(orm, sqs, urls, config.sqs.dlqName)) metrics.addGauge(gauge);
+            return metrics;
+          },
+        },
+        { provide: METRICS, useExisting: PrometheusMetrics },
         { provide: LOGGER, useValue: new JsonLogger("http") },
         { provide: MikroORM, useFactory: () => MikroORM.init(ormConfig(config.databaseUrl)) },
         { provide: SQSClient, useFactory: () => createSqsClient(config.sqs) },
         {
           provide: TRANSACTION_RUNNER,
-          inject: [MikroORM, CLOCK],
-          useFactory: (orm: MikroORM, clock: Clock) =>
-            new MikroOrmTransactionRunner(orm, clock, { lockTimeoutMs: config.lockTimeoutMs }),
+          inject: [MikroORM, CLOCK, METRICS],
+          useFactory: (orm: MikroORM, clock: Clock, metrics: Metrics) =>
+            new MikroOrmTransactionRunner(orm, clock, { lockTimeoutMs: config.lockTimeoutMs }, metrics),
         },
         {
           provide: EventFactory,
@@ -199,7 +224,7 @@ export class AppModule implements NestModule {
   }
 
   configure(consumer: MiddlewareConsumer): void {
-    consumer.apply(correlationMiddleware).forRoutes("*");
+    consumer.apply(correlationMiddleware(this.logger, this.metrics)).forRoutes("*");
   }
 }
 
