@@ -1,0 +1,39 @@
+name: wagering
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: wagering
+      POSTGRES_PASSWORD: wagering
+      POSTGRES_DB: wagering
+    ports:
+      # 55432 para nao colidir com um Postgres instalado na maquina.
+      - "55432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wagering -d wagering"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # MiniStack: emulador AWS gratuito compativel com LocalStack (o SQS do
+  # LocalStack Community passou a exigir plano pago).
+  sqs:
+    image: ministackorg/ministack:latest
+    ports:
+      - "4566:4566"
+
+  # Cria as filas FIFO e a DLQ com redrive; sai com 0 quando termina.
+  sqs-init:
+    image: amazon/aws-cli:2.27.0
+    depends_on:
+      - sqs
+    environment:
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+      SQS_ENDPOINT: http://sqs:4566
+      MAX_RECEIVE_COUNT: "5"
+    volumes:
+      - ./infra/sqs/init.sh:/init.sh:ro
+    entrypoint: ["sh", "/init.sh"]
