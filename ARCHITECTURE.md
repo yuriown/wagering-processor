@@ -453,6 +453,23 @@ de 2 s cada (falha = tirar do balanceador). Ambos sem autenticacao.
 | Uma unica moeda testada de ponta a ponta (BRL) | permitido pelo enunciado | o modelo e multi-moeda (`UNIQUE (player_id, currency)`) e o conflito de moeda e testado; escala fixa de 2 casas |
 | MiniStack no lugar do LocalStack | o SQS do LocalStack Community virou pago | emulador menos difundido; FIFO, dedup, visibilidade e redrive foram verificados antes de adotar |
 
+### Evolução para Escala Extrema (Visão Staff)
+
+Dois pontos frequentemente levantados em revisões de arquitetura para cenários de hiperescala:
+
+1. **Outbox: Polling `SKIP LOCKED` vs. `LISTEN/NOTIFY` vs. CDC (Logical Replication)**
+   - **Comportamento atual:** O `PollingLoop` emenda execuções com `delay = 0` sempre que encontra registros pendentes (`done > 0`), mantendo fluxo contínuo sob carga. O intervalo de 500ms só é acionado em estado ocioso. O lag observado no teste de carga com CPU a 112% decorreu da disputa de CPU local e do throughput de publicação do SQS, não de espera do timer.
+   - **`LISTEN/NOTIFY` (Oportunidades e Riscos):**
+     - *Vantagem:* Reduz a latência de publicação de eventos isolados em momentos de baixa atividade (<10 ms vs ~250 ms médios de espera de tick) e elimina queries de polling quando o sistema está inativo.
+     - *Riscos no mundo real:* (a) *Thundering Herd:* se 10 instâncias ouvirem o canal, uma única inserção acorda todas as 10 ao mesmo tempo, fazendo todas executarem `SELECT ... SKIP LOCKED`; (b) *Entrega at-most-once:* notificações do Postgres são efêmeras (podem ser descartadas se o buffer estourar ou durante reconexões), exigindo manter um polling de fallback periódico; (c) *PgBouncer:* incompatível com pool em modo transação (exige conexões de sessão dedicadas).
+   - **Solução padrão ouro para hiperescala:** Em vez de polling ou triggers, adotar **Change Data Capture (CDC)** via replicação lógica do PostgreSQL (ex.: Debezium / Kafka Connect lendo diretamente do WAL). Isso elimina qualquer query no banco relacional e desonera a CPU do Postgres.
+
+2. **Hot Wallet: Pessimistic Lock (`SELECT FOR UPDATE`) vs. In-Memory Event Sourcing (LMAX/Actors)**
+   - **Comportamento atual:** O lock pessimista limita o teto de uma mesma carteira a ~40 TPS (dependente do tempo de transação). Para usuários humanos (onde 1 a 3 apostas por segundo já é o limite físico do jogador), essa restrição é irrelevante e garante invariantes ACID estritas, zero saldo negativo e auditoria imediata no banco relacional.
+   - **Evolução para centenas de TPS no mesmo usuário (Bots / High Frequency Auto-Bet):**
+     - Exigiria migrar a carteira para um modelo em memória com fila serializada (LMAX Disruptor ou Actor Model em nós dedicados), aplicando deltas de saldo em memória e fazendo flush assíncrono em lotes para o PostgreSQL.
+     - *Trade-off:* Troca a garantia síncrona imediata do Postgres por consistência eventual, exigindo replicação e recuperação de estado complexa caso o nó em memória caia antes do flush para o disco. No domínio de cassinos e pagamentos, a garantia relacional estrita com `SELECT FOR UPDATE` é a escolha padrão da indústria para proteção de caixa.
+
 ## Falhas eliminatorias: como cada uma e evitada
 
 | Falha eliminatoria | Como e evitada | Prova |
